@@ -28,6 +28,28 @@ class _FakeStore:
         self.closed = True
 
 
+class _RecordingStore(_FakeStore):
+    """A store that remembers what it was asked to write, and can be told to fail."""
+
+    def __init__(self, memories=None, fail: bool = False):
+        super().__init__(memories)
+        self.saved: list[dict] = []
+        self.archived: list[str] = []
+        self.fail = fail
+
+    def save(self, content, *, memory_type="fact", priority="P2", role="assistant",
+             chat_id="", embed=True) -> list[int]:
+        if self.fail:
+            return []
+        self.saved.append({"content": content, "memory_type": memory_type,
+                           "priority": priority, "role": role, "chat_id": chat_id})
+        return [len(self.saved)]
+
+    def archive(self, content: str) -> int:
+        self.archived.append(content)
+        return 1
+
+
 def _memory(id_: int = 1, content: str = "Переезд в декабре") -> dict:
     return {"id": id_, "content": content, "memory_type": "fact", "priority": "P2", "created_at": None}
 
@@ -240,10 +262,18 @@ def test_setup_asks_for_the_connection_string_and_treats_it_as_a_secret():
     assert fields["openrouter_key"]["required"] is False
 
 
-def test_this_step_offers_recall_and_no_way_to_write():
+def test_the_agent_can_both_look_things_up_and_put_them_away():
     names = [schema["name"] for schema in AidaMemoryProvider().get_tool_schemas()]
 
-    assert names == ["aida_recall"]
+    assert names == ["aida_recall", "aida_remember"]
+
+
+def test_a_raw_conversation_line_is_not_something_the_agent_saves_by_hand():
+    # Verbatim lines are kept for it automatically; offering "dialogue" as a deliberate
+    # choice would only invite it to re-save what is already being kept.
+    remember = [s for s in AidaMemoryProvider().get_tool_schemas() if s["name"] == "aida_remember"][0]
+
+    assert "dialogue" not in remember["parameters"]["properties"]["memory_type"]["enum"]
 
 
 def test_the_agent_is_told_the_memory_is_his_own():
@@ -251,6 +281,138 @@ def test_the_agent_is_told_the_memory_is_his_own():
 
     assert "first person" in block
     assert "YOUR OWN past" in block
+
+
+# -- writing: what the operator asks to be remembered --------------------------------------
+
+
+def test_a_thought_the_operator_asked_to_keep_reaches_the_shared_memory():
+    store = _RecordingStore()
+    provider = _provider(store)
+    provider._session_id = "session-7"
+
+    answer = provider.handle_tool_call(
+        "aida_remember", {"content": "Переезд в декабре", "memory_type": "event", "priority": "P1"}
+    )
+
+    assert store.saved[0]["content"] == "Переезд в декабре"
+    assert store.saved[0]["memory_type"] == "event" and store.saved[0]["priority"] == "P1"
+    assert store.saved[0]["chat_id"].startswith("hermes:")
+    assert "Запомнил" in answer
+
+
+def test_a_thought_that_could_not_be_saved_is_reported_rather_than_silently_lost():
+    provider = _provider(_RecordingStore(fail=True))
+
+    answer = provider.handle_tool_call("aida_remember", {"content": "Переезд в декабре"})
+
+    assert "Не записал" in answer
+
+
+def test_an_empty_thought_is_refused():
+    store = _RecordingStore()
+
+    assert "empty" in _provider(store).handle_tool_call("aida_remember", {"content": "   "})
+    assert store.saved == []
+
+
+def test_a_long_thought_is_reported_as_split_so_nobody_thinks_it_was_cut():
+    store = _RecordingStore()
+
+    answer = _provider(store).handle_tool_call("aida_remember", {"content": "Переезд. " * 400})
+
+    assert "частями" in answer
+
+
+# -- writing: the agent's own notes --------------------------------------------------------
+
+
+def test_a_note_the_agent_keeps_about_the_operator_lands_in_the_shared_memory_too():
+    store = _RecordingStore()
+    provider = _provider(store)
+
+    provider.on_memory_write("add", "user", "Пьёт кофе без сахара", {})
+
+    assert store.saved[0]["memory_type"] == "preference"
+    assert store.saved[0]["priority"] == "P1"  # curated by hand, not overheard
+
+
+def test_a_note_about_the_work_is_mirrored_as_a_plain_fact():
+    store = _RecordingStore()
+
+    _provider(store).on_memory_write("add", "memory", "Шлюз перезапускается командой", {})
+
+    assert store.saved[0]["memory_type"] == "fact"
+
+
+def test_replacing_a_note_puts_the_old_wording_away_and_keeps_the_new_one():
+    store = _RecordingStore()
+
+    _provider(store).on_memory_write("replace", "memory", "новое", {"old_text": "старое"})
+
+    assert store.archived == ["старое"]
+    assert store.saved[0]["content"] == "новое"
+
+
+def test_removing_a_note_stops_it_surfacing_without_writing_anything_new():
+    store = _RecordingStore()
+
+    _provider(store).on_memory_write("remove", "memory", "уже неправда", {})
+
+    assert store.archived == ["уже неправда"]
+    assert store.saved == []
+
+
+# -- writing: the conversation itself ------------------------------------------------------
+
+
+def test_a_finished_turn_waits_locally_instead_of_holding_up_the_reply(tmp_path):
+    from plugins.memory.aida.queue_db import TurnQueue
+
+    provider = _provider(_RecordingStore())
+    provider._queue = TurnQueue(tmp_path / "queue.db")
+
+    provider.sync_turn("что там с переездом", "в декабре", session_id="session-7")
+
+    rows = provider._queue.pending()
+    assert [row["role"] for row in rows] == ["user", "assistant"]
+    assert rows[0]["session_id"] == "session-7"
+
+
+def test_a_turn_is_never_pushed_to_the_shared_store_mid_conversation(tmp_path):
+    from plugins.memory.aida.queue_db import TurnQueue
+
+    store = _RecordingStore()
+    provider = _provider(store)
+    provider._queue = TurnQueue(tmp_path / "queue.db")
+
+    provider.sync_turn("вопрос", "ответ", session_id="session-7")
+
+    assert store.saved == []  # the nightly job carries it, not the turn
+
+
+def test_a_helper_agent_working_in_the_background_does_not_write_to_the_shared_memory(tmp_path):
+    # Only the agent the operator is actually talking to writes; otherwise a subagent's
+    # scratch work would end up in the memory as if it had been said out loud.
+    store = _RecordingStore()
+    provider = AidaMemoryProvider()
+    provider._store = store
+    provider.initialize("session-7", hermes_home=str(tmp_path), agent_context="subagent")
+
+    provider.sync_turn("вопрос", "ответ", session_id="session-7")
+    provider.on_memory_write("add", "memory", "что-то", {})
+    answer = provider.handle_tool_call("aida_remember", {"content": "что-то"})
+
+    assert store.saved == []
+    assert provider._queue.count() == 0
+    assert "does not write" in answer
+
+
+def test_a_missing_local_queue_costs_the_record_of_the_turn_but_not_the_turn():
+    provider = _provider(_RecordingStore())
+    provider._queue = None
+
+    provider.sync_turn("вопрос", "ответ")  # must not raise
 
 
 def test_teardown_releases_the_database_and_waits_for_a_running_recall():

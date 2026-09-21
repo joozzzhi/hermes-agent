@@ -20,12 +20,14 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from agent.memory_provider import MemoryProvider, RecallStatus, spawn_context_thread
 from agent.secret_scope import get_secret
 from tools.registry import tool_error
 
+from .queue_db import TurnQueue
 from .search import (
     FTS_SQL,
     VECTOR_SQL,
@@ -33,6 +35,20 @@ from .search import (
     format_block,
     row_to_memory,
     to_vector_literal,
+)
+from .write import (
+    ARCHIVE_SQL,
+    DUPLICATE_SQL,
+    EMBED_SQL,
+    INSERT_SQL,
+    MEMORY_TYPES,
+    PRIORITIES,
+    SOURCE_PREFIX,
+    chunk_content,
+    describe_saved,
+    insert_params,
+    normalise_type,
+    source_tag,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,6 +75,32 @@ MAX_LIMIT = 20
 # the automatic per-turn block is trimmed harder — see ENTRY_BUDGET in search.py.
 TOOL_ENTRY_BUDGET = 2000
 TOOL_BLOCK_BUDGET = 12000
+
+REMEMBER_SCHEMA = {
+    "name": "aida_remember",
+    "description": (
+        "Save one thought into your long-term memory, so it outlives this conversation and is "
+        "there on every surface you talk to the operator on. One thought per call, phrased so "
+        "it still makes sense in a month with no other context."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "content": {"type": "string", "description": "The thought itself, self-contained."},
+            "memory_type": {
+                "type": "string",
+                "enum": list(MEMORY_TYPES[:-1]),  # a deliberate write is never a raw dialogue line
+                "description": "What kind of memory this is (default: fact).",
+            },
+            "priority": {
+                "type": "string",
+                "enum": list(PRIORITIES),
+                "description": "P1 stays, P3 fades (default: P2).",
+            },
+        },
+        "required": ["content"],
+    },
+}
 
 RECALL_SCHEMA = {
     "name": "aida_recall",
@@ -109,7 +151,7 @@ class _Store:
             options=f"-c statement_timeout={STATEMENT_TIMEOUT_MS}",
         )
 
-    def _fetch(self, sql: str, params: dict) -> list[dict]:
+    def _execute(self, sql: str, params: dict) -> list[tuple]:
         """Run one statement, reconnecting once if the held connection went stale."""
         for attempt in (1, 2):
             try:
@@ -117,7 +159,7 @@ class _Store:
                     self._conn = self._connect()
                 with self._conn.cursor() as cur:
                     cur.execute(sql, params)
-                    return [row_to_memory(row) for row in cur.fetchall()]
+                    return list(cur.fetchall()) if cur.description else []
             except Exception:
                 try:
                     if self._conn is not None:
@@ -127,6 +169,9 @@ class _Store:
                 if attempt == 2:
                     raise
         return []
+
+    def _fetch(self, sql: str, params: dict) -> list[dict]:
+        return [row_to_memory(row) for row in self._execute(sql, params)]
 
     def close(self) -> None:
         with self._lock:
@@ -183,12 +228,77 @@ class _Store:
                 return []
         return combine_rrf(vector_hits, fts_hits)[:limit]
 
+    # -- writing ---------------------------------------------------------------------
+
+    def save(self, content: str, *, memory_type: str = "fact", priority: str = "P2",
+             role: str = "assistant", chat_id: str = "", embed: bool = True) -> list[int]:
+        """Write one memory, split into parts if it is too long. Returns the row ids written.
+
+        Raises nothing upward on a database failure — the caller is a turn in progress, and a
+        memory that could not be written is worth a warning, not a broken conversation.
+        """
+        chunks = chunk_content(content)
+        if not chunks:
+            return []
+        written: list[int] = []
+        with self._lock:
+            try:
+                for chunk in chunks:
+                    duplicate = self._execute(
+                        DUPLICATE_SQL, {"content": chunk, "source": SOURCE_PREFIX + "%"}
+                    )
+                    if duplicate:
+                        continue
+                    rows = self._execute(
+                        INSERT_SQL,
+                        insert_params(chunk, memory_type=memory_type, priority=priority,
+                                      role=role, chat_id=chat_id or source_tag()),
+                    )
+                    if rows:
+                        written.append(int(rows[0][0]))
+            except Exception as exc:
+                logger.warning("Aida memory: could not write, the thought stays unsaved: %s", exc)
+                return []
+        if embed and written:
+            spawn_context_thread(self._embed_rows, args=(written,), name="aida-embed").start()
+        return written
+
+    def _embed_rows(self, ids: list[int]) -> None:
+        """Fill in the vector after the row exists. A missing vector costs ranking, not the memory."""
+        for row_id in ids:
+            content_rows = self._execute_guarded("SELECT content FROM memories WHERE id = %(id)s", {"id": row_id})
+            if not content_rows:
+                continue
+            vector = self._embed(str(content_rows[0][0]))
+            if vector is None:
+                return  # no embeddings available at all — stop rather than retry per row
+            self._execute_guarded(EMBED_SQL, {"vec": to_vector_literal(vector), "id": row_id})
+
+    def _execute_guarded(self, sql: str, params: dict) -> list[tuple]:
+        with self._lock:
+            try:
+                return self._execute(sql, params)
+            except Exception as exc:
+                logger.debug("Aida memory: background statement failed (%s)", exc)
+                return []
+
+    def archive(self, content: str) -> int:
+        """Stop a memory this agent wrote from surfacing, without deleting it."""
+        content = (content or "").strip()
+        if not content:
+            return 0
+        rows = self._execute_guarded(ARCHIVE_SQL, {"content": content, "source": SOURCE_PREFIX + "%"})
+        return len(rows)
+
 
 class AidaMemoryProvider(MemoryProvider):
     """Recall from the operator's shared memory, visibly, on every non-trivial turn."""
 
     def __init__(self) -> None:
         self._store: _Store | None = None
+        self._queue: TurnQueue | None = None
+        self._session_id: str = ""
+        self._writes_enabled: bool = True
         self._lock = threading.Lock()
         self._pending: str = ""
         self._pending_count: int = 0
@@ -225,6 +335,16 @@ class AidaMemoryProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._store = _Store(get_secret("SUPABASE_DB_URL", "") or "", get_secret("OPENROUTER_API_KEY", "") or "")
+        self._session_id = session_id
+        # Only the agent the operator is actually talking to writes. A subagent, a cron run or
+        # a flush would otherwise fill the shared memory with work nobody said out loud.
+        self._writes_enabled = str(kwargs.get("agent_context", "primary") or "primary") == "primary"
+        home = Path(str(kwargs.get("hermes_home") or "."))
+        try:
+            self._queue = TurnQueue(home / "aida_queue.db")
+        except Exception as exc:
+            logger.warning("Aida memory: the local queue is unavailable, turns will not be kept: %s", exc)
+            self._queue = None
 
     def system_prompt_block(self) -> str:
         return (
@@ -234,7 +354,10 @@ class AidaMemoryProvider(MemoryProvider):
             "with him, including conversations from before this machine existed: speak of it in the "
             "first person, never as another assistant's transcript.\n"
             "Recalled entries arrive automatically before your reply. Use `aida_recall` when you need "
-            "to look something up on purpose. Memory is quoted, not guessed — if it is not there, say so."
+            "to look something up on purpose. Memory is quoted, not guessed — if it is not there, say so.\n"
+            "Use `aida_remember` for something that must outlive this conversation — a decision, a "
+            "preference, an arrangement, a fact about him. One thought per call, written so it still "
+            "makes sense in a month. The conversation itself is kept without you doing anything."
         )
 
     # -- recall lifecycle --------------------------------------------------------------
@@ -272,16 +395,55 @@ class AidaMemoryProvider(MemoryProvider):
             return None
         return RecallStatus(provider_label="Память", count=self._last_count)
 
+    # -- writing -----------------------------------------------------------------------
+
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", **kwargs) -> None:
+        """Keep the turn locally; the nightly job carries it to the shared store.
+
+        Nothing here talks to the database — an answer must not wait on the network, and a
+        day's conversation is worth one batch rather than two round trips per reply.
+        """
+        if self._queue is None or not self._writes_enabled:
+            return
+        session = session_id or self._session_id
+        try:
+            self._queue.enqueue(session, "user", user_content)
+            self._queue.enqueue(session, "assistant", assistant_content)
+        except Exception as exc:
+            logger.debug("Aida memory: could not queue the turn (%s)", exc)
+
+    def on_memory_write(self, action: str, target: str, content: str,
+                        metadata: dict[str, Any] | None = None) -> None:
+        """Mirror what the agent writes into its own notes, so both sides hold the same thing.
+
+        A note the agent curated about the operator is a deliberate, lasting statement — it
+        goes in at the highest priority. Removing a note stops it surfacing here too, but the
+        row stays in the store: a mistaken removal costs a query, never a fact.
+        """
+        if self._store is None or not self._writes_enabled:
+            return
+        memory_type = "preference" if target == "user" else "fact"
+        old_text = str((metadata or {}).get("old_text") or "")
+        if action in ("remove", "replace") and old_text:
+            self._store.archive(old_text)
+        if action in ("add", "replace"):
+            self._store.save(content, memory_type=memory_type, priority="P1",
+                             role="system", chat_id=source_tag(self._session_id))
+        elif action == "remove" and not old_text:
+            self._store.archive(content)
+
     # -- tools -------------------------------------------------------------------------
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        return [RECALL_SCHEMA]
+        return [RECALL_SCHEMA, REMEMBER_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
-        if tool_name != RECALL_SCHEMA["name"]:
-            return tool_error(f"Unknown tool: {tool_name}")
         if self._store is None:
             return tool_error("Shared memory is not configured")
+        if tool_name == REMEMBER_SCHEMA["name"]:
+            return self._handle_remember(args)
+        if tool_name != RECALL_SCHEMA["name"]:
+            return tool_error(f"Unknown tool: {tool_name}")
         # `or DEFAULT_LIMIT` would be wrong here: a requested 0 is a nonsense count, not an
         # unstated one, and it belongs at the floor rather than back at the default.
         asked = args.get("top_k")
@@ -296,11 +458,33 @@ class AidaMemoryProvider(MemoryProvider):
         # to leave room for the conversation, and this is how the rest is reached.
         return format_block(memories, entry_budget=TOOL_ENTRY_BUDGET, block_budget=TOOL_BLOCK_BUDGET)
 
+    def _handle_remember(self, args: dict[str, Any]) -> str:
+        content = str(args.get("content") or "").strip()
+        if not content:
+            return tool_error("Nothing to remember — the thought is empty")
+        if not self._writes_enabled:
+            return tool_error("This agent does not write to the shared memory")
+        memory_type = normalise_type(args.get("memory_type"))
+        written = self._store.save(
+            content,
+            memory_type=memory_type,
+            priority=str(args.get("priority") or "P2"),
+            role="assistant",
+            chat_id=source_tag(self._session_id),
+        )
+        if not written:
+            # Either it is already in memory, or the store refused it. Both are worth saying
+            # plainly: silence here reads as "saved" and the thought would be lost.
+            return "Не записал: либо это уже есть в памяти, либо база сейчас недоступна."
+        return describe_saved(chunk_content(content), memory_type)
+
     def shutdown(self) -> None:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
         if self._store is not None:
             self._store.close()
+        if self._queue is not None:
+            self._queue.close()
 
 
 def register(ctx) -> None:
