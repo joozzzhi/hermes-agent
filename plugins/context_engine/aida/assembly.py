@@ -20,6 +20,19 @@ OLD_HISTORY_BUDGET = 10_000
 # ~2 000 знаков): «дословно» не должно значить «до 400 знаков и многоточие».
 OLD_QUOTE_CLIP = 2_000
 MIN_TAIL_BUDGET = 20_000
+# Бюджет запроса от окна модели: 5% окна, в знаках. Для окна в миллион токенов это прежние
+# 150 000; для меньшего окна число меньше, но не ниже MIN_TOTAL_BUDGET. Знаки, а не токены, потому
+# что считать токены нечем, а трёх знаков на токен хватает для порядка величины.
+WINDOW_SHARE = 0.05
+CHARS_PER_TOKEN = 3
+MIN_TOTAL_BUDGET = 90_000
+# Старение выхлопа инструментов: результаты старше этого числа последних ходов и длиннее порога
+# заменяются в запросе заглушкой. Выхлоп — три четверти объёма разговора, а реплики человека и
+# агента — остальное. Замер на этой самой сборке (бюджет 150 000 знаков, размеры по замеру
+# оператора): хвост вмещает ~24 хода без старения и ~73 с порогом 500 знаков; порог 1 000 даёт
+# только ~53, потому что около 40% результатов короче него.
+KEEP_FULL_TURNS = 2
+AGE_MIN_CHARS = 500
 # Когда хвост упёрся в потолок, его начало сдвигается сразу до этой доли бюджета. Сдвиг ломает кеш
 # поставщика для всего, что после системной части, поэтому он должен быть редким и крупным.
 STEP_KEEP = 0.6
@@ -121,6 +134,49 @@ def safe_tail(messages: list[dict], budget: int) -> list[dict]:
     if start >= len(messages):
         return messages[-1:]
     return messages[start:]
+
+
+def total_budget_for(window_tokens: int | None) -> int:
+    """Бюджет запроса в знаках от размера окна модели; окно неизвестно — прежние 150 000."""
+    if not window_tokens or window_tokens <= 0:
+        return TOTAL_BUDGET
+    return max(MIN_TOTAL_BUDGET, int(window_tokens * WINDOW_SHARE * CHARS_PER_TOKEN))
+
+
+def _is_real_user(message: dict) -> bool:
+    return message.get("role") == "user" and not _is_tool_result(message)
+
+
+def _stub_for(message: dict, size: int) -> str:
+    name = message.get("name") or message.get("tool_name")
+    label = f"«{name}» " if name else ""
+    return (f"[{label}отпущен из запроса: {size} знаков; оригинал в сессии — повтори вызов или "
+            "найди через session_search]")
+
+
+def age_tool_results(messages: list[dict], *, keep_turns: int = KEEP_FULL_TURNS,
+                     min_chars: int = AGE_MIN_CHARS) -> tuple[list[dict], int]:
+    """Заменить в запросе старые длинные результаты инструментов заглушкой. Хранилище не трогается.
+
+    «Старые» — до реплики человека, с которой начинаются последние keep_turns ходов; текущий ход
+    и предыдущий остаются целиком. Обращение к инструменту и его пара не меняются: заменяется
+    только текст результата, а `tool_call_id` и роль остаются, поэтому поставщик пару принимает.
+    Возвращает новый список и число замен; вход не изменяется.
+    """
+    user_positions = [i for i, m in enumerate(messages) if _is_real_user(m)]
+    if len(user_positions) < keep_turns:
+        return messages, 0
+    boundary = user_positions[-keep_turns]
+    aged = 0
+    out = list(messages)
+    for index in range(boundary):
+        message = messages[index]
+        content = message.get("content")
+        if message.get("role") != "tool" or not isinstance(content, str) or len(content) <= min_chars:
+            continue
+        out[index] = {**message, "content": _stub_for(message, len(content))}
+        aged += 1
+    return (out, aged) if aged else (messages, 0)
 
 
 def message_key(message: dict) -> int:
@@ -265,8 +321,9 @@ def assemble_with_anchor(
     *,
     total_budget: int = TOTAL_BUDGET,
     anchor: int | None = None,
-) -> tuple[list[dict], int | None]:
-    """Собрать запрос заново и вернуть его вместе с отпечатком начала хвоста.
+    age_tools: bool = True,
+) -> tuple[list[dict], int | None, int]:
+    """Собрать запрос заново и вернуть его, отпечаток начала хвоста и число состаренных результатов.
 
     Порядок не случайный. Системная часть и знание меняются редко и стоят первыми — на них
     держится кеш поставщика. Изменчивое подмешивается к вопросу текущего хода на каждом запросе
@@ -281,12 +338,14 @@ def assemble_with_anchor(
     if knowledge:
         assembled.append({"role": "system", "content": knowledge})
 
-    tail, new_anchor = select_tail(conversation, tail_budget, anchor)
+    # Сначала стареем, потом режем хвост: бюджет должен считаться по тому, что реально уйдёт.
+    aged, aged_count = age_tool_results(conversation) if age_tools else (conversation, 0)
+    tail, new_anchor = select_tail(aged, tail_budget, anchor)
     dynamic = "\n\n".join(block for block in (recalled, old_history) if block)
     if dynamic:
         tail = _attach_to_current_question(tail, dynamic)
     assembled.extend(tail)
-    return assembled, new_anchor
+    return assembled, new_anchor, aged_count
 
 
 def assemble(
@@ -297,7 +356,8 @@ def assemble(
     conversation: list[dict],
     *,
     total_budget: int = TOTAL_BUDGET,
+    age_tools: bool = True,
 ) -> list[dict]:
     """Собрать запрос без памяти о прошлых запросах (начало хвоста считается заново)."""
     return assemble_with_anchor(system_head, knowledge, recalled, old_history, conversation,
-                                total_budget=total_budget)[0]
+                                total_budget=total_budget, age_tools=age_tools)[0]

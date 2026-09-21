@@ -44,6 +44,7 @@ from .assembly import (
     message_size,
     safe_tail,
     split_system,
+    total_budget_for,
 )
 
 logger = logging.getLogger(__name__)
@@ -115,6 +116,8 @@ class AidaContextEngine(ContextEngine):
         # Начало хвоста по разговору: ключ — отпечаток первой реплики разговора, значение —
         # отпечаток реплики, с которой хвост начинается. Один шлюз ведёт несколько разговоров.
         self._anchors: OrderedDict[int, int] = OrderedDict()
+        # Сколько результатов инструментов уже состарено в запросе — по тому же ключу разговора.
+        self._aged_counts: OrderedDict[int, int] = OrderedDict()
 
     # -- хозяйство -----------------------------------------------------------------
 
@@ -169,19 +172,47 @@ class AidaContextEngine(ContextEngine):
             conversation_key = message_key(conversation[0]) if conversation else None
             with self._lock:
                 anchor = self._anchors.get(conversation_key)
-            assembled, new_anchor = assemble_with_anchor(
+            if budget_tokens:
+                self.total_budget = total_budget_for(budget_tokens)
+            assembled, new_anchor, aged_count = assemble_with_anchor(
                 system_head, knowledge, recalled, old_history, conversation,
                 total_budget=self.total_budget, anchor=anchor)
-            if conversation_key is not None and new_anchor is not None:
+            if conversation_key is not None:
                 with self._lock:
-                    self._anchors[conversation_key] = new_anchor
-                    self._anchors.move_to_end(conversation_key)
-                    while len(self._anchors) > MAX_TRACKED_CONVERSATIONS:
-                        self._anchors.popitem(last=False)
+                    grew = aged_count > self._aged_counts.get(conversation_key, 0)
+                    if new_anchor is not None:
+                        self._anchors[conversation_key] = new_anchor
+                    self._aged_counts[conversation_key] = aged_count
+                    for tracked in (self._anchors, self._aged_counts):
+                        if conversation_key in tracked:
+                            tracked.move_to_end(conversation_key)
+                        while len(tracked) > MAX_TRACKED_CONVERSATIONS:
+                            tracked.popitem(last=False)
+                if grew:
+                    # Модель, которой понадобился отпущенный результат, перечитает файл. Без
+                    # сброса хозяин ответил бы «файл не менялся» — в расчёте на содержимое,
+                    # которое мы только что убрали из запроса.
+                    self._reset_read_dedup()
             return assembled
         except Exception:
             logger.warning("Витрина: собрать не удалось, запрос уходит как есть", exc_info=True)
             return None
+
+    @staticmethod
+    def _reset_read_dedup() -> None:
+        """Штатный сброс учёта «этот файл уже читали и он не менялся» (для всех задач сразу)."""
+        try:
+            from tools.file_tools_read_tracking import reset_file_dedup
+
+            reset_file_dedup(None)
+        except Exception:
+            logger.debug("Витрина: сбросить учёт чтения файлов не удалось", exc_info=True)
+        try:
+            from tools.skills_tool_dedup import reset_skill_view_dedup
+
+            reset_skill_view_dedup(None)
+        except Exception:
+            logger.debug("Витрина: сбросить учёт просмотра навыков не удалось", exc_info=True)
 
     @staticmethod
     def _question_text(request_messages: list[dict], incoming_message: dict | None) -> str:

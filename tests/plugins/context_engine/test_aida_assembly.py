@@ -344,3 +344,93 @@ def test_an_old_line_of_conversation_is_not_cut_at_four_hundred_signs():
     block = build_old_history_block(rows)
 
     assert long_line.strip() in block and "[…]" not in block
+
+
+# -- старение выхлопа инструментов и бюджет от окна ----------------------------------------
+
+
+def _work_turn(index: int, result_size: int = 5_000) -> list[dict]:
+    call_id = f"c{index}"
+    return [
+        _user(f"вопрос {index}"),
+        {"role": "assistant", "content": "", "tool_calls": [{"id": call_id, "function": {"name": "read_file"}}]},
+        {"role": "tool", "tool_call_id": call_id, "name": "read_file", "content": "р" * result_size},
+        _assistant(f"ответ {index}"),
+    ]
+
+
+def test_old_long_tool_results_are_replaced_and_recent_ones_are_left_whole():
+    from plugins.context_engine.aida.assembly import age_tool_results
+
+    conversation = [m for i in range(5) for m in _work_turn(i)]
+
+    aged, count = age_tool_results(conversation)
+
+    results = [m for m in aged if m.get("role") == "tool"]
+    assert count == 3                                   # ходы 0, 1, 2 состарены; 3 и 4 целые
+    assert all("отпущен из запроса" in m["content"] for m in results[:3])
+    assert all(m["content"] == "р" * 5_000 for m in results[3:])
+    assert "5000 знаков" in results[0]["content"] and "read_file" in results[0]["content"]
+
+
+def test_aging_keeps_every_tool_pair_intact_and_leaves_the_input_alone():
+    from plugins.context_engine.aida.assembly import age_tool_results
+
+    conversation = [m for i in range(5) for m in _work_turn(i)]
+    snapshot = [dict(m) for m in conversation]
+
+    aged, _ = age_tool_results(conversation)
+
+    assert conversation == snapshot
+    assert [m.get("tool_call_id") for m in aged] == [m.get("tool_call_id") for m in conversation]
+    assert [m.get("role") for m in aged] == [m.get("role") for m in conversation]
+    assert [m.get("tool_calls") for m in aged] == [m.get("tool_calls") for m in conversation]
+
+
+def test_short_results_and_results_of_the_current_turn_are_never_aged():
+    from plugins.context_engine.aida.assembly import age_tool_results
+
+    short = [m for i in range(5) for m in _work_turn(i, result_size=400)]
+    assert age_tool_results(short) == (short, 0)
+
+    current = [_user("вопрос"), _calls_tool(), _tool_result("р" * 15_000)]
+    assert age_tool_results(current) == (current, 0)
+
+
+def test_results_that_are_not_text_are_left_alone():
+    from plugins.context_engine.aida.assembly import age_tool_results
+
+    conversation = [m for i in range(5) for m in _work_turn(i)]
+    conversation[2] = {**conversation[2], "content": [{"type": "image", "source": "..."}]}
+
+    aged, count = age_tool_results(conversation)
+
+    assert aged[2]["content"] == conversation[2]["content"] and count == 2
+
+
+def test_with_aging_the_same_budget_holds_many_more_turns():
+    conversation = [m for i in range(60) for m in _work_turn(i)]
+
+    def person_turns(age: bool) -> int:
+        request = assemble([], "", "", "", conversation, total_budget=60_000, age_tools=age)
+        return sum(1 for m in request if m.get("role") == "user")
+
+    assert person_turns(True) >= 3 * person_turns(False)
+
+
+def test_aged_request_still_never_starts_with_an_orphaned_result():
+    conversation = [m for i in range(30) for m in _work_turn(i)]
+
+    for budget in (25_000, 40_000, 60_000):
+        request = assemble([], "", "", "", conversation, total_budget=budget)
+        called = {c["id"] for m in request for c in (m.get("tool_calls") or ())}
+        assert all(m.get("tool_call_id") in called for m in request if m.get("role") == "tool")
+
+
+def test_the_budget_follows_the_window_of_the_model():
+    from plugins.context_engine.aida.assembly import TOTAL_BUDGET, total_budget_for
+
+    assert total_budget_for(1_000_000) == 150_000 == TOTAL_BUDGET   # для окна в миллион — прежнее число
+    assert total_budget_for(2_000_000) == 300_000
+    assert total_budget_for(200_000) == 90_000                       # не ниже пола
+    assert total_budget_for(0) == TOTAL_BUDGET and total_budget_for(None) == TOTAL_BUDGET

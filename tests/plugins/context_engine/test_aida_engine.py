@@ -265,3 +265,51 @@ def test_two_conversations_through_one_engine_keep_their_own_start_of_tail():
     assert len(a) < 40 * 2                       # у длинного разговора хвост обрезан
     assert len(b) == 1 + 6 * 2                   # у короткого — цел, и чужое начало ему не мешает
     assert a_again == a                          # начало хвоста у A запомнено и не поехало
+
+
+def _aging_request(turns: int) -> list[dict]:
+    request = [{"role": "system", "content": "личность"}]
+    for index in range(turns):
+        request += [
+            {"role": "user", "content": f"вопрос {index}"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": f"c{index}", "function": {"name": "read_file"}}]},
+            {"role": "tool", "tool_call_id": f"c{index}", "content": "р" * 4_000},
+            {"role": "assistant", "content": f"ответ {index}"},
+        ]
+    return request
+
+
+def test_the_read_dedup_is_reset_only_when_more_results_have_been_released(monkeypatch):
+    resets = []
+    monkeypatch.setattr(AidaContextEngine, "_reset_read_dedup", staticmethod(lambda: resets.append(1)))
+    eng = _engine(_Store())
+
+    eng.select_context(_aging_request(2))       # ничего не состарено
+    assert resets == []
+    eng.select_context(_aging_request(4))       # два результата отпущены
+    assert len(resets) == 1
+    eng.select_context(_aging_request(4))       # тот же запрос ещё раз: новых замен нет
+    assert len(resets) == 1
+    eng.select_context(_aging_request(5))       # ещё один
+    assert len(resets) == 2
+
+
+def test_a_failing_dedup_reset_never_breaks_the_request(monkeypatch):
+    import tools.file_tools_read_tracking as tracking
+
+    def boom(_task_id=None):
+        raise RuntimeError("учёт недоступен")
+
+    monkeypatch.setattr(tracking, "reset_file_dedup", boom)
+
+    selected = _engine(_Store()).select_context(_aging_request(4))
+
+    assert selected and selected[-1]["role"] == "assistant" or selected
+
+
+def test_the_window_of_the_model_sets_the_budget():
+    eng = _engine(_Store())
+
+    eng.select_context(_request(), budget_tokens=200_000)
+
+    assert eng.total_budget == 90_000
