@@ -1,0 +1,8 @@
+name: aida
+version: 0.1.0
+description: "Общая память оператора — та же база, что у телеграм-бота и сессий разработки. Гермес вспоминает из неё как из своей."
+pip_dependencies:
+  - "psycopg[binary]>=3.1"
+  - requests
+requires_env:
+  - SUPABASE_DB_URL
