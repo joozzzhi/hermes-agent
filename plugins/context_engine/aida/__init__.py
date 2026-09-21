@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import OrderedDict
 from typing import Any
 
 from agent.context_engine import ContextEngine
@@ -35,10 +36,11 @@ from .assembly import (
     OLD_HISTORY_BUDGET,
     RECALLED_BUDGET,
     TOTAL_BUDGET,
-    assemble,
+    assemble_with_anchor,
     build_knowledge_block,
     build_old_history_block,
     build_recalled_block,
+    message_key,
     message_size,
     safe_tail,
     split_system,
@@ -53,6 +55,7 @@ KNOWLEDGE_TTL = 600.0
 
 RECALL_LIMIT = 8
 OLD_HISTORY_LIMIT = 5
+MAX_TRACKED_CONVERSATIONS = 64
 
 P1_SQL = """
 SELECT content, memory_type FROM memories
@@ -109,6 +112,9 @@ class AidaContextEngine(ContextEngine):
         self._store_tried = False
         self._recall_signal = _load_recall_signal()
         self._announced = False
+        # Начало хвоста по разговору: ключ — отпечаток первой реплики разговора, значение —
+        # отпечаток реплики, с которой хвост начинается. Один шлюз ведёт несколько разговоров.
+        self._anchors: OrderedDict[int, int] = OrderedDict()
 
     # -- хозяйство -----------------------------------------------------------------
 
@@ -160,8 +166,19 @@ class AidaContextEngine(ContextEngine):
             question = self._question_text(request_messages, incoming_message)
             knowledge = self._knowledge_block(store)
             recalled, old_history = self._dynamic_blocks(store, question)
-            return assemble(system_head, knowledge, recalled, old_history, conversation,
-                            total_budget=self.total_budget)
+            conversation_key = message_key(conversation[0]) if conversation else None
+            with self._lock:
+                anchor = self._anchors.get(conversation_key)
+            assembled, new_anchor = assemble_with_anchor(
+                system_head, knowledge, recalled, old_history, conversation,
+                total_budget=self.total_budget, anchor=anchor)
+            if conversation_key is not None and new_anchor is not None:
+                with self._lock:
+                    self._anchors[conversation_key] = new_anchor
+                    self._anchors.move_to_end(conversation_key)
+                    while len(self._anchors) > MAX_TRACKED_CONVERSATIONS:
+                        self._anchors.popitem(last=False)
+            return assembled
         except Exception:
             logger.warning("Витрина: собрать не удалось, запрос уходит как есть", exc_info=True)
             return None

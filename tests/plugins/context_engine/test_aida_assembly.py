@@ -184,12 +184,44 @@ def test_no_system_message_is_ever_planted_in_the_middle_of_the_conversation():
     assert all(m.get("role") != "system" for m in assembled[first_non_system:])
 
 
-def test_context_found_for_the_question_is_not_repeated_during_tool_work():
-    # Внутри хода вопрос уже прозвучал: подмешивать найденное второй раз — это платить
-    # за него снова и сбивать кеш на каждом обращении к инструменту.
+def test_context_found_for_the_question_stays_with_it_during_tool_work():
+    # Ход — это несколько запросов, а хозяин историю после подмены не меняет: подмешанное
+    # живёт один запрос. Ответ пишется на последнем запросе хода, уже после инструментов, и не
+    # должен остаться без найденного.
     conversation = [_user("вопрос"), _calls_tool(), _tool_result()]
 
     assembled = assemble([], "", "# Вспомнил\n- деталь", "", conversation)
+
+    question = next(m for m in assembled if m.get("role") == "user")
+    assert "Вспомнил" in question["content"] and question["content"].endswith("вопрос")
+    assert not any("Вспомнил" in str(m.get("content", "")) for m in assembled if m is not question)
+
+
+def test_the_question_is_byte_identical_on_every_request_of_the_turn():
+    # Одинаковые байты — условие, при котором кеш поставщика не ломается внутри хода.
+    turn = [_user("вопрос")]
+    first = assemble([], "", "# Вспомнил\n- деталь", "", turn)
+    turn += [_calls_tool(), _tool_result()]
+    second = assemble([], "", "# Вспомнил\n- деталь", "", turn)
+    turn += [_calls_tool(), _tool_result("ещё")]
+    third = assemble([], "", "# Вспомнил\n- деталь", "", turn)
+
+    assert first[0] == second[0] == third[0]
+
+
+def test_only_the_current_question_carries_what_was_found_not_the_older_ones():
+    conversation = [_user("старый вопрос"), _assistant("ответ"), _user("новый вопрос"),
+                    _calls_tool(), _tool_result()]
+
+    assembled = assemble([], "", "# Вспомнил\n- деталь", "", conversation)
+
+    assert assembled[0]["content"] == "старый вопрос"
+    assert "Вспомнил" in assembled[2]["content"]
+
+
+def test_a_tail_with_no_person_in_it_gets_no_found_block_and_no_crash():
+    assembled = assemble([], "", "# Вспомнил\n- деталь", "", [_calls_tool(), _tool_result()],
+                         total_budget=1)
 
     assert not any("Вспомнил" in str(m.get("content", "")) for m in assembled)
 
@@ -233,3 +265,82 @@ def test_any_budget_produces_a_request_that_is_still_a_conversation(budget):
 
     assert assembled[-1]["role"] == "user"
     assert assembled[0]["role"] == "system"
+
+
+# -- ступенчатое начало хвоста -------------------------------------------------------------
+
+
+def _turns(count: int, size: int = 1000) -> list[dict]:
+    """count ходов «вопрос — ответ» по size знаков каждая реплика, у каждого вопроса свой текст."""
+    out: list[dict] = []
+    for index in range(count):
+        out.append(_user(f"вопрос {index} " + "в" * size))
+        out.append(_assistant(f"ответ {index} " + "о" * size))
+    return out
+
+
+def test_the_start_of_the_tail_stays_put_while_the_tail_fits():
+    from plugins.context_engine.aida.assembly import select_tail
+
+    conversation = _turns(10)
+    tail, anchor = select_tail(conversation, budget=30_000)
+    grown = conversation + _turns(1)[:1]
+    tail2, anchor2 = select_tail(grown, budget=30_000, anchor=anchor)
+
+    assert anchor2 == anchor
+    assert tail2[0] == tail[0]
+    assert len(tail2) == len(tail) + 1
+
+
+def test_when_the_tail_no_longer_fits_it_steps_forward_in_one_big_move():
+    from plugins.context_engine.aida.assembly import STEP_KEEP, message_size, select_tail
+
+    conversation = _turns(20)                    # ~40 000 знаков
+    tail, anchor = select_tail(conversation, budget=30_000)
+    assert sum(message_size(m) for m in tail) <= 30_000
+
+    # добавляем ходы, пока не потребуется сдвиг, и запоминаем, сколько раз начало двигалось
+    starts = [tail[0]["content"]]
+    grown = list(conversation)
+    for index in range(20, 40):
+        grown += [_user(f"вопрос {index} " + "в" * 1000), _assistant(f"ответ {index} " + "о" * 1000)]
+        tail, anchor = select_tail(grown, budget=30_000, anchor=anchor)
+        if tail[0]["content"] != starts[-1]:
+            starts.append(tail[0]["content"])
+            # после шага хвост заметно короче бюджета: следующий сдвиг будет не скоро
+            assert sum(message_size(m) for m in tail) <= 30_000 * STEP_KEEP + 2_100
+
+    assert 1 < len(starts) <= 4                  # начало сдвинулось несколько раз, а не двадцать
+
+
+def test_a_stepped_tail_never_splits_a_tool_pair():
+    from plugins.context_engine.aida.assembly import select_tail
+
+    conversation = []
+    for index in range(30):
+        conversation += [_user(f"вопрос {index}"), _calls_tool(), _tool_result("р" * 2_000), _assistant("ок")]
+    anchor = None
+    for cut in range(8, len(conversation) + 1, 3):
+        tail, anchor = select_tail(conversation[:cut], budget=8_000, anchor=anchor)
+        assert tail[0].get("role") != "tool"
+        called = {c["id"] for m in tail for c in (m.get("tool_calls") or ())}
+        assert all(m.get("tool_call_id") in called for m in tail if m.get("role") == "tool")
+
+
+def test_a_lost_anchor_falls_back_to_a_fresh_cut_instead_of_failing():
+    from plugins.context_engine.aida.assembly import select_tail
+
+    conversation = _turns(10)
+    tail, anchor = select_tail(conversation, budget=30_000, anchor=12345)
+
+    assert tail and anchor != 12345
+
+
+def test_an_old_line_of_conversation_is_not_cut_at_four_hundred_signs():
+    long_line = "я думаю о переезде " * 60          # ~1 100 знаков
+    rows = [{"content": long_line, "memory_type": "dialogue", "role": "user",
+             "created_at": datetime(2026, 8, 12)}]
+
+    block = build_old_history_block(rows)
+
+    assert long_line.strip() in block and "[…]" not in block

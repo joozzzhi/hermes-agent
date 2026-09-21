@@ -15,8 +15,14 @@ from typing import Any, Iterable
 TOTAL_BUDGET = 150_000
 KNOWLEDGE_BUDGET = 12_000
 RECALLED_BUDGET = 15_000
-OLD_HISTORY_BUDGET = 6_000
+OLD_HISTORY_BUDGET = 10_000
+# Цитата давнего разговора режется только по размеру самой записи в базе (она не бывает длиннее
+# ~2 000 знаков): «дословно» не должно значить «до 400 знаков и многоточие».
+OLD_QUOTE_CLIP = 2_000
 MIN_TAIL_BUDGET = 20_000
+# Когда хвост упёрся в потолок, его начало сдвигается сразу до этой доли бюджета. Сдвиг ломает кеш
+# поставщика для всего, что после системной части, поэтому он должен быть редким и крупным.
+STEP_KEEP = 0.6
 
 # Заголовки групп — из того же движка. Модель читает их как оглавление, человек — как
 # карту того, что о нём знают.
@@ -117,6 +123,42 @@ def safe_tail(messages: list[dict], budget: int) -> list[dict]:
     return messages[start:]
 
 
+def message_key(message: dict) -> int:
+    """Отпечаток сообщения по содержимому: им запоминается, с какой реплики начинается хвост.
+
+    У сообщений запроса нет стабильных номеров — хозяин каждый раз собирает их заново, — а
+    содержимое реплики между запросами не меняется.
+    """
+    return hash((message.get("role"), str(message.get("content")),
+                 message.get("tool_call_id"), str(message.get("tool_calls"))))
+
+
+def select_tail(messages: list[dict], budget: int, anchor: int | None = None) -> tuple[list[dict], int | None]:
+    """Хвост разговора со ступенчатым началом: неподвижный, пока влезает, и крупный шаг, когда нет.
+
+    Скользящий хвост (начало пересчитывается на каждом запросе) сдвигается почти на каждом ходу, а
+    каждый сдвиг делает недействительным кеш поставщика для всего после системной части. Здесь
+    начало запоминается: пока хвост от него влезает в бюджет, он остаётся тем же и запрос
+    дописывается только в конец. Когда не влезает — режем сразу до STEP_KEEP от бюджета и
+    запоминаем новое начало. Возвращает хвост и отпечаток его первой реплики.
+    """
+    if not messages:
+        return [], anchor
+    if anchor is not None:
+        for index, message in enumerate(messages):
+            if message_key(message) != anchor:
+                continue
+            kept = messages[index:]
+            if is_clean_boundary(messages, index) and sum(message_size(m) for m in kept) <= budget:
+                return kept, anchor
+            break
+    if sum(message_size(m) for m in messages) <= budget:
+        tail = safe_tail(messages, budget)
+    else:
+        tail = safe_tail(messages, max(int(budget * STEP_KEEP), 1))
+    return tail, message_key(tail[0]) if tail else anchor
+
+
 def _clip(text: str, budget: int) -> str:
     if len(text) <= budget:
         return text
@@ -171,7 +213,8 @@ def build_old_history_block(rows: Iterable[dict], budget: int = OLD_HISTORY_BUDG
         created = row.get("created_at")
         when = created.strftime("%Y-%m-%d") if hasattr(created, "strftime") else ""
         who = "Оператор" if row.get("role") == "user" else "Я"
-        line = f"[{when}] {who}: {_clip(content, 400)}" if when else f"{who}: {_clip(content, 400)}"
+        line = (f"[{when}] {who}: {_clip(content, OLD_QUOTE_CLIP)}" if when
+                else f"{who}: {_clip(content, OLD_QUOTE_CLIP)}")
         if spent + len(line) > budget:
             break
         lines.append(line)
@@ -198,7 +241,22 @@ def _prepend_to_question(message: dict, block: str) -> dict:
     return {**message, "content": merged}
 
 
-def assemble(
+def _attach_to_current_question(tail: list[dict], dynamic: str) -> list[dict]:
+    """Подмешать изменчивый слой к вопросу ТЕКУЩЕГО хода — последней реплике человека в хвосте.
+
+    Ход состоит из нескольких запросов к модели (после каждого обращения к инструменту уходит
+    новый), а хозяин историю после нашей подмены не меняет: подмешанное живёт ровно один запрос.
+    Поэтому на каждом запросе хода подмешиваем заново к той же реплике — байты одинаковые, а
+    ответ, который пишется после инструментов, не остаётся без найденного.
+    """
+    for index in range(len(tail) - 1, -1, -1):
+        message = tail[index]
+        if message.get("role") == "user" and not _is_tool_result(message):
+            return tail[:index] + [_prepend_to_question(message, dynamic)] + tail[index + 1:]
+    return tail
+
+
+def assemble_with_anchor(
     system_head: list[dict],
     knowledge: str,
     recalled: str,
@@ -206,15 +264,14 @@ def assemble(
     conversation: list[dict],
     *,
     total_budget: int = TOTAL_BUDGET,
-) -> list[dict]:
-    """Собрать запрос заново: устойчивое впереди, изменчивое при вопросе, хвост дословно.
+    anchor: int | None = None,
+) -> tuple[list[dict], int | None]:
+    """Собрать запрос заново и вернуть его вместе с отпечатком начала хвоста.
 
     Порядок не случайный. Системная часть и знание меняются редко и стоят первыми — на них
-    держится кеш поставщика. Изменчивое подмешивается к последнему вопросу, чтобы не
-    вставлять системные сообщения в середину разговора и не сбивать кеш каждым ходом.
-
-    Если последнее сообщение — не вопрос человека (идёт обмен с инструментами внутри
-    хода), изменчивый слой не добавляется: он уже приехал вместе с самим вопросом.
+    держится кеш поставщика. Изменчивое подмешивается к вопросу текущего хода на каждом запросе
+    хода, чтобы не вставлять системные сообщения в середину разговора. Начало хвоста
+    запоминается между запросами (см. select_tail), чтобы кеш ломался редко и крупно.
     """
     spent = len(knowledge) + len(recalled) + len(old_history)
     spent += sum(message_size(m) for m in system_head)
@@ -224,9 +281,23 @@ def assemble(
     if knowledge:
         assembled.append({"role": "system", "content": knowledge})
 
-    tail = safe_tail(conversation, tail_budget)
+    tail, new_anchor = select_tail(conversation, tail_budget, anchor)
     dynamic = "\n\n".join(block for block in (recalled, old_history) if block)
-    if dynamic and tail and tail[-1].get("role") == "user":
-        tail = tail[:-1] + [_prepend_to_question(tail[-1], dynamic)]
+    if dynamic:
+        tail = _attach_to_current_question(tail, dynamic)
     assembled.extend(tail)
-    return assembled
+    return assembled, new_anchor
+
+
+def assemble(
+    system_head: list[dict],
+    knowledge: str,
+    recalled: str,
+    old_history: str,
+    conversation: list[dict],
+    *,
+    total_budget: int = TOTAL_BUDGET,
+) -> list[dict]:
+    """Собрать запрос без памяти о прошлых запросах (начало хвоста считается заново)."""
+    return assemble_with_anchor(system_head, knowledge, recalled, old_history, conversation,
+                                total_budget=total_budget)[0]

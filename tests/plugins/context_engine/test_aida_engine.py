@@ -220,3 +220,48 @@ def test_the_engine_registers_itself_the_way_the_host_expects():
     engine_module.register(_Ctx())
 
     assert isinstance(collected["engine"], AidaContextEngine)
+
+
+# -- ход с инструментами и несколько разговоров ---------------------------------------------
+
+
+def _tool_turn_request(question: str, steps: int) -> list[dict]:
+    request = [{"role": "system", "content": "личность"}, {"role": "user", "content": question}]
+    for step in range(steps):
+        request.append({"role": "assistant", "content": "",
+                        "tool_calls": [{"id": f"c{step}", "function": {"name": "bash"}}]})
+        request.append({"role": "tool", "tool_call_id": f"c{step}", "content": "готово"})
+    return request
+
+
+def test_what_memory_found_reaches_every_request_of_a_turn_that_uses_tools():
+    store = _Store(found=[{"content": "переезд в декабре", "memory_type": "event", "created_at": None}])
+    eng = _engine(store)
+
+    requests = [eng.select_context(_tool_turn_request("что с переездом", steps)) for steps in (0, 1, 2)]
+
+    for selected in requests:
+        question = next(m for m in selected if m.get("role") == "user")
+        assert "переезд в декабре" in question["content"]
+    assert requests[0][1] == requests[1][1] == requests[2][1]
+    assert store.recall_calls == 1               # искали один раз на ход, не на каждый запрос
+
+
+def test_two_conversations_through_one_engine_keep_their_own_start_of_tail():
+    eng = _engine(_Store())
+    eng.total_budget = 40_000
+
+    def conversation(tag: str, turns: int) -> list[dict]:
+        request = [{"role": "system", "content": "личность"}]
+        for index in range(turns):
+            request += [{"role": "user", "content": f"{tag} вопрос {index} " + "в" * 1500},
+                        {"role": "assistant", "content": f"{tag} ответ {index} " + "о" * 1500}]
+        return request
+
+    a = eng.select_context(conversation("A", 40))
+    b = eng.select_context(conversation("B", 6))
+    a_again = eng.select_context(conversation("A", 40))
+
+    assert len(a) < 40 * 2                       # у длинного разговора хвост обрезан
+    assert len(b) == 1 + 6 * 2                   # у короткого — цел, и чужое начало ему не мешает
+    assert a_again == a                          # начало хвоста у A запомнено и не поехало
