@@ -183,9 +183,9 @@ class _Store:
 
     # -- embeddings ------------------------------------------------------------------
 
-    def _embed(self, text: str) -> list[float] | None:
-        """Vector for the question, or None — a missing vector costs ranking, not recall."""
-        if not self._api_key:
+    def _embed_all(self, texts: list[str]) -> list[list[float]] | None:
+        """Vectors for one or more texts, or None when the service is not answering at all."""
+        if not self._api_key or not texts:
             return None
         try:
             import requests
@@ -193,15 +193,21 @@ class _Store:
             response = requests.post(
                 EMBEDDING_URL,
                 headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
-                json={"model": EMBEDDING_MODEL, "input": text},
-                timeout=EMBEDDING_TIMEOUT,
+                json={"model": EMBEDDING_MODEL, "input": texts},
+                timeout=EMBEDDING_TIMEOUT * max(1, len(texts) // 4),
             )
             response.raise_for_status()
-            vector = response.json()["data"][0]["embedding"]
-            return vector if isinstance(vector, list) and vector else None
+            data = response.json().get("data") or []
+            vectors = [item.get("embedding") or [] for item in data]
+            return vectors if len(vectors) == len(texts) else None
         except Exception as exc:
             logger.debug("Aida memory: embedding unavailable, searching by words only (%s)", exc)
             return None
+
+    def _embed(self, text: str) -> list[float] | None:
+        """Vector for the question, or None — a missing vector costs ranking, not recall."""
+        vectors = self._embed_all([text])
+        return vectors[0] if vectors and vectors[0] else None
 
     # -- recall ----------------------------------------------------------------------
 
@@ -281,6 +287,53 @@ class _Store:
             except Exception as exc:
                 logger.debug("Aida memory: background statement failed (%s)", exc)
                 return []
+
+    # -- what the nightly job needs ---------------------------------------------------
+
+    def alive(self) -> bool:
+        """False while the store is in its back-off after a failure."""
+        return time.monotonic() >= self._blocked_until
+
+    # A blank or single-character memory has no meaning to embed, and the service refuses it.
+    # Left in the queue it would be retried every night forever and, worse, take the rest of
+    # the batch down with it — measured on this store: 68 rows stopped the pass dead.
+    _EMBEDDABLE = "embedding IS NULL AND status = 'active' AND char_length(btrim(content)) >= 2"
+
+    def rows_without_embedding(self, limit: int) -> list[tuple]:
+        """Oldest memories that cannot be found by meaning yet."""
+        return self._execute_guarded(
+            f"SELECT id, content FROM memories WHERE {self._EMBEDDABLE} ORDER BY id LIMIT %(limit)s",
+            {"limit": limit},
+        )
+
+    def count_without_embedding(self) -> int:
+        rows = self._execute_guarded(f"SELECT count(*) FROM memories WHERE {self._EMBEDDABLE}", {})
+        return int(rows[0][0]) if rows else 0
+
+    def set_embedding(self, row_id: int, vector: list[float]) -> bool:
+        return bool(self._execute_guarded(
+            EMBED_SQL + " RETURNING id", {"vec": to_vector_literal(vector), "id": row_id}
+        ))
+
+    def embed_many(self, texts: list[str]) -> list[list[float]] | None:
+        """Vectors for several texts at once, or None when embeddings are unavailable at all.
+
+        The distinction matters to the caller: an empty vector for one text is one memory that
+        stays word-searchable, while None means the whole pass should stop rather than spend
+        the night retrying a service that is not answering.
+        """
+        if not texts:
+            return []
+        batch = self._embed_all(texts)
+        if batch is not None:
+            return batch
+        # The provider may have refused ONE of the texts rather than the work. One at a time
+        # is slower but keeps a single unembeddable memory from costing the whole night.
+        vectors: list[list[float]] = []
+        for text in texts:
+            single = self._embed(text)
+            vectors.append(single or [])
+        return vectors if any(vectors) else None
 
     def archive(self, content: str) -> int:
         """Stop a memory this agent wrote from surfacing, without deleting it."""

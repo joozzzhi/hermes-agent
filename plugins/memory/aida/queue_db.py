@@ -25,6 +25,17 @@ CREATE TABLE IF NOT EXISTS pending_turns (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS pending_turns_session_idx ON pending_turns (session_id);
+
+-- Обмены ждут разбора отдельно от реплик. Реплика уезжает в базу сразу, а разбор может
+-- не состояться — модель молчит, квота кончилась. Без этой очереди такой обмен не
+-- разобрался бы уже никогда: реплик в первой очереди к тому моменту нет.
+CREATE TABLE IF NOT EXISTS pending_exchanges (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  question TEXT NOT NULL,
+  answer TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -81,6 +92,44 @@ class TurnQueue:
     def count(self) -> int:
         with self._lock:
             return int(self._conn.execute("SELECT count(*) FROM pending_turns").fetchone()[0])
+
+    # -- обмены, ждущие разбора ---------------------------------------------------------
+
+    def enqueue_exchange(self, session_id: str, question: str, answer: str) -> bool:
+        question, answer = (question or "").strip(), (answer or "").strip()
+        if not question or not answer:
+            return False
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO pending_exchanges (session_id, question, answer) VALUES (?, ?, ?)",
+                (session_id or "session", question, answer),
+            )
+            self._conn.commit()
+        return True
+
+    def pending_exchanges(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, session_id, question, answer FROM pending_exchanges ORDER BY id LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [{"id": r[0], "session_id": r[1], "question": r[2], "answer": r[3]} for r in rows]
+
+    def release_exchanges(self, ids: Iterable[int]) -> int:
+        ids = [int(i) for i in ids]
+        if not ids:
+            return 0
+        with self._lock:
+            placeholders = ",".join("?" for _ in ids)
+            cursor = self._conn.execute(
+                f"DELETE FROM pending_exchanges WHERE id IN ({placeholders})", ids
+            )
+            self._conn.commit()
+            return cursor.rowcount
+
+    def count_exchanges(self) -> int:
+        with self._lock:
+            return int(self._conn.execute("SELECT count(*) FROM pending_exchanges").fetchone()[0])
 
     def close(self) -> None:
         with self._lock:
