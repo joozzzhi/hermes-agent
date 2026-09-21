@@ -27,6 +27,7 @@ from agent.memory_provider import MemoryProvider, RecallStatus, spawn_context_th
 from agent.secret_scope import get_secret
 from tools.registry import tool_error
 
+from . import recall_signal
 from .queue_db import TurnQueue
 from .search import (
     FTS_SQL,
@@ -419,6 +420,11 @@ class AidaMemoryProvider(MemoryProvider):
         """Recall in the background after a turn; :meth:`prefetch` hands it over on the next."""
         if self._store is None:
             return
+        if recall_signal.engine_is_assembling():
+            # The context engine assembles the window from this same store, and it does so
+            # for the question being asked rather than the one before it. Searching again
+            # here would put a second copy of the same memories into the request.
+            return
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=2.0)
             if self._thread.is_alive():
@@ -441,12 +447,16 @@ class AidaMemoryProvider(MemoryProvider):
         return block
 
     def recall_status(self) -> RecallStatus | None:
-        """What the LAST prefetch injected. The operator asked to always see that memory was
+        """What the LAST recall injected. The operator asked to always see that memory was
         consulted, including when it came back with nothing — so a completed recall with no
-        hits still reports, and only "no recall happened at all" stays silent."""
-        if self._last_count is None:
+        hits still reports, and only "no recall happened at all" stays silent.
+
+        When the context engine is the one assembling, the count comes from it: the search
+        happens once, and the indicator still tells the operator what was raised."""
+        count = recall_signal.last_count() if recall_signal.engine_is_assembling() else self._last_count
+        if count is None:
             return None
-        return RecallStatus(provider_label="Память", count=self._last_count)
+        return RecallStatus(provider_label="Память", count=count)
 
     # -- writing -----------------------------------------------------------------------
 
