@@ -202,100 +202,122 @@ def test_a_fact_too_short_or_too_long_to_be_one_is_dropped(content):
     assert nightly_job.parse_facts(raw) == []
 
 
-# -- разбор без ключа и с падающей моделью --------------------------------------------------
+# -- кто отвечает на разбор --------------------------------------------------------------
 
 
-def test_without_a_model_key_the_night_ships_the_conversation_and_says_it_skipped_the_rest(
-    tmp_path, monkeypatch, capsys
-):
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+def test_the_agent_s_own_model_layer_is_asked_first(monkeypatch):
+    # У агента уже есть и подписка, и обновление доступа, и запасные пути. Своя копия
+    # авторизации рядом была бы вторым местом, где всё это ломается.
+    calls = []
+    monkeypatch.setattr(nightly_job, "_ask_through_agent", lambda m: calls.append(m) or "ответ")
+    monkeypatch.setattr(nightly_job, "_ask_over_http", lambda m: pytest.fail("не должно вызываться"))
+
+    assert nightly_job.ask_model([{"role": "user", "content": "вопрос"}]) == "ответ"
+    assert len(calls) == 1
+
+
+def test_a_key_call_stands_in_when_the_agent_is_not_around(monkeypatch):
+    monkeypatch.setattr(nightly_job, "_ask_through_agent", lambda m: None)
+    monkeypatch.setattr(nightly_job, "_ask_over_http", lambda m: "запасной ответ")
+
+    assert nightly_job.ask_model([{"role": "user", "content": "вопрос"}]) == "запасной ответ"
+
+
+def test_silence_from_every_model_is_reported_as_silence(monkeypatch):
+    monkeypatch.setattr(nightly_job, "_ask_through_agent", lambda m: None)
+    monkeypatch.setattr(nightly_job, "_ask_over_http", lambda m: None)
+
+    assert nightly_job.ask_model([{"role": "user", "content": "вопрос"}]) is None
+
+
+def test_the_light_model_is_the_one_asked(monkeypatch):
+    # Разбор — работа лёгкая: прочитать обмен и назвать, что в нём стоит помнить.
+    captured = {}
+
+    class _FakeCaller:
+        @staticmethod
+        def call_llm(**kwargs):
+            captured.update(kwargs)
+            return type("R", (), {"choices": [type("C", (), {
+                "message": type("M", (), {"content": "[]"})()
+            })()]})()
+
+    monkeypatch.setitem(__import__("sys").modules, "agent.auxiliary_client", _FakeCaller)
+
+    nightly_job._ask_through_agent([{"role": "user", "content": "вопрос"}])
+
+    assert captured["model"] == nightly_job.DISTILL_MODEL == "claude-haiku-4-5"
+    assert captured["temperature"] == 0
+
+
+def test_a_model_that_is_down_does_not_take_the_night_with_it(monkeypatch, capsys):
+    class _Broken:
+        @staticmethod
+        def call_llm(**kwargs):
+            raise RuntimeError("provider unavailable")
+
+    monkeypatch.setitem(__import__("sys").modules, "agent.auxiliary_client", _Broken)
+
+    assert nightly_job._ask_through_agent([{"role": "user", "content": "вопрос"}]) is None
+    assert "недоступна" in capsys.readouterr().out
+
+
+# -- разбор без ответа модели --------------------------------------------------------------
+
+
+def test_an_exchange_the_model_could_not_answer_waits_for_the_next_night(tmp_path, monkeypatch, capsys):
+    # Реплики к этому моменту уже в базе: не сохрани мы обмен здесь, разобрать его
+    # было бы больше нечем и факт пропал бы молча.
+    monkeypatch.setattr(nightly_job, "ask_model", lambda messages: None)
     store = _Store()
     queue = _queue(tmp_path, [])
-    queue.enqueue_exchange("s1", "вопрос про переезд", "ответ")
+    queue.enqueue_exchange("s1", "длинный вопрос про переезд в декабре", "ответ")
 
-    written = nightly_job.distill(store, queue)
-
-    assert written == 0
-    assert "разбор пропущен" in capsys.readouterr().out
-    assert queue.count_exchanges() == 1  # ждёт, а не потеряно
+    assert nightly_job.distill(store, queue) == 0
+    assert queue.count_exchanges() == 1
+    assert "модель не ответила" in capsys.readouterr().out
     queue.close()
 
 
 def test_a_short_exchange_is_not_worth_a_model_call(tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "key")
-    monkeypatch.setenv("AIDA_DISTILL_MODELS", "some/model")
+    monkeypatch.setattr(nightly_job, "ask_model", lambda messages: pytest.fail("не должно вызываться"))
     store = _Store()
     queue = _queue(tmp_path, [])
     queue.enqueue_exchange("s1", "ок", "ага")
-    calls = []
-
-    class _Requests:
-        @staticmethod
-        def post(*args, **kwargs):
-            calls.append(kwargs)
-            raise AssertionError("не должно вызываться")
-
-    monkeypatch.setitem(__import__("sys").modules, "requests", _Requests)
 
     assert nightly_job.distill(store, queue) == 0
-    assert calls == []
     assert queue.count_exchanges() == 0  # короткий обмен отпущен, а не копится вечно
     queue.close()
 
 
-def test_an_exchange_the_model_could_not_answer_waits_for_the_next_night(tmp_path, monkeypatch):
-    # Реплики к этому моменту уже в базе: не сохрани мы обмен здесь, разобрать его
-    # было бы больше нечем и факт пропал бы молча.
-    monkeypatch.setenv("OPENROUTER_API_KEY", "key")
-    monkeypatch.setenv("AIDA_DISTILL_MODELS", "some/model")
-    store = _Store()
-    queue = _queue(tmp_path, [])
-    queue.enqueue_exchange("s1", "длинный вопрос про переезд в декабре", "ответ")
-
-    class _Response:
-        status_code = 503
-        text = "unavailable"
-
-    class _Requests:
-        @staticmethod
-        def post(*args, **kwargs):
-            return _Response()
-
-    monkeypatch.setitem(__import__("sys").modules, "requests", _Requests)
-
-    assert nightly_job.distill(store, queue) == 0
-    assert queue.count_exchanges() == 1
-    queue.close()
-
-
 def test_an_exchange_that_was_distilled_is_not_distilled_again(tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "key")
-    monkeypatch.setenv("AIDA_DISTILL_MODELS", "some/model")
+    monkeypatch.setattr(
+        nightly_job, "ask_model",
+        lambda messages: '[{"content": "Переезд в декабре", "type": "event", "priority": "P1"}]',
+    )
     store = _Store()
     queue = _queue(tmp_path, [])
     queue.enqueue_exchange("s1", "длинный вопрос про переезд в декабре", "ответ")
-
-    class _Response:
-        status_code = 200
-
-        @staticmethod
-        def json():
-            return {"choices": [{"message": {
-                "content": '[{"content": "Переезд в декабре", "type": "event", "priority": "P1"}]'
-            }}]}
-
-    class _Requests:
-        @staticmethod
-        def post(*args, **kwargs):
-            return _Response()
-
-    monkeypatch.setitem(__import__("sys").modules, "requests", _Requests)
 
     assert nightly_job.distill(store, queue) == 1
     assert store.saved[0]["content"] == "Переезд в декабре"
     assert store.saved[0]["priority"] == "P1"
     assert queue.count_exchanges() == 0
+    queue.close()
+
+
+def test_a_fact_found_at_night_is_left_for_the_batch_that_fills_in_meaning_search(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        nightly_job, "ask_model",
+        lambda messages: '[{"content": "Переезд в декабре", "type": "event", "priority": "P1"}]',
+    )
+    store = _Store()
+    queue = _queue(tmp_path, [])
+    queue.enqueue_exchange("s1", "длинный вопрос про переезд в декабре", "ответ")
+
+    nightly_job.distill(store, queue)
+
+    assert store.saved[0]["embed"] is False
     queue.close()
 
 

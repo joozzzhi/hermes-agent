@@ -49,7 +49,17 @@ MAX_FACTS_PER_EXCHANGE = 5
 # секундах разбор молча возвращал ноль, хотя модель работала (замер 21.09.2026).
 DISTILL_TIMEOUT = 60.0
 
-# Разбор — не главная модель: классификации не нужен гигант, а квота общая с ботом.
+# Разбор ведёт Haiku — работа лёгкая (прочитать обмен и назвать, что в нём стоит помнить),
+# и она ей по силам: в замере 21.09.2026 она достала из обмена три факта с верными типами
+# за 4 секунды, там где прежняя модель доставала один и думала двадцать.
+#
+# Зовём её через собственный слой моделей Гермеса: он уже умеет и подписку, и обновление
+# доступа, и запасные пути. Своя копия авторизации рядом означала бы второе место, где всё
+# это ломается.
+DISTILL_MODEL = os.environ.get("AIDA_DISTILL_MODEL", "claude-haiku-4-5")
+
+# Запасной путь — прямой вызов по ключу, для случая, когда скрипт запускают отдельно от
+# агента и его слой моделей недоступен.
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 GEMINI_MODEL = os.environ.get("AIDA_DISTILL_GEMINI_MODEL", "gemini-3.6-flash")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -182,6 +192,65 @@ def parse_facts(raw: str) -> list[dict]:
     return facts
 
 
+def ask_model(messages: list[dict]) -> str | None:
+    """Спросить модель один раз: сначала через слой Гермеса, потом по прямому ключу.
+
+    Возвращает текст ответа или None, если не ответил никто. Молчание здесь обязано быть
+    отличимо от «ничего важного не нашлось» — иначе потерянный факт выглядит как работа.
+    """
+    content = _ask_through_agent(messages)
+    if content:
+        return content
+    return _ask_over_http(messages)
+
+
+def _ask_through_agent(messages: list[dict]) -> str | None:
+    """Вызов через собственный слой моделей агента — основной путь."""
+    try:
+        from agent.auxiliary_client import call_llm
+    except Exception:
+        return None  # скрипт запущен отдельно от агента
+    try:
+        response = call_llm(
+            task="memory_extraction",
+            model=DISTILL_MODEL,
+            messages=messages,
+            temperature=0,
+            max_tokens=800,
+            timeout=DISTILL_TIMEOUT,
+        )
+        return response.choices[0].message.content or None
+    except Exception as exc:
+        print(f"  разбор: модель агента недоступна ({type(exc).__name__}), пробую по ключу")
+        return None
+
+
+def _ask_over_http(messages: list[dict]) -> str | None:
+    """Запасной путь: прямой вызов по ключу из окружения."""
+    targets = _model_targets()
+    if not targets:
+        return None
+    import requests
+
+    for target in targets:
+        try:
+            response = requests.post(
+                f"{target['url']}/chat/completions",
+                headers={"Authorization": f"Bearer {target['key']}", "Content-Type": "application/json"},
+                json={"model": target["model"], "messages": messages,
+                      "temperature": 0, "max_tokens": 800, "stream": False},
+                timeout=DISTILL_TIMEOUT,
+            )
+            if response.status_code >= 400:
+                continue
+            content = response.json()["choices"][0]["message"]["content"]
+            if content:
+                return content
+        except Exception:
+            continue
+    return None
+
+
 def _model_targets() -> list[dict]:
     """Цепочка попыток. У Gemini своя квота, поэтому он первый, если ключ есть."""
     targets = []
@@ -207,13 +276,6 @@ def distill(store, queue, limit: int = MAX_EXCHANGES_PER_RUN) -> int:
     Обмен покидает очередь, только когда модель на него ответила. Не ответила — он ждёт
     следующей ночи: реплики к тому времени уже в базе, и разобрать их иначе было бы нечем.
     """
-    targets = _model_targets()
-    if not targets:
-        print("  разбор пропущен: нет ключа к модели")
-        return 0
-
-    import requests
-
     written = 0
     unanswered = 0
     for exchange in queue.pending_exchanges(limit=limit):
@@ -221,26 +283,10 @@ def distill(store, queue, limit: int = MAX_EXCHANGES_PER_RUN) -> int:
         if len(question.strip()) < MIN_EXCHANGE_LENGTH:
             queue.release_exchanges([exchange["id"]])  # слишком коротко, чтобы нести факт
             continue
-        messages = [
+        content = ask_model([
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"Человек: {question}\n\nАссистент: {answer}"},
-        ]
-        content = None
-        for target in targets:
-            try:
-                response = requests.post(
-                    f"{target['url']}/chat/completions",
-                    headers={"Authorization": f"Bearer {target['key']}", "Content-Type": "application/json"},
-                    json={"model": target["model"], "messages": messages,
-                          "temperature": 0, "max_tokens": 800, "stream": False},
-                    timeout=DISTILL_TIMEOUT,
-                )
-                if response.status_code >= 400:
-                    continue
-                content = response.json()["choices"][0]["message"]["content"]
-                break
-            except Exception:
-                continue
+        ])
         if not content:
             unanswered += 1
             continue
