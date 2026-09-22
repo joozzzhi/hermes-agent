@@ -117,8 +117,14 @@ def safe_tail(messages: list[dict], budget: int) -> list[dict]:
     """Свежий хвост разговора, целиком влезающий в бюджет и не рвущий ни одной пары.
 
     Отсчитывается с конца; найденная по бюджету граница сдвигается вперёд до ближайшей
-    чистой. Если чистой границы нет вовсе (весь хвост — одна длинная инструментальная
-    цепочка), берётся последнее сообщение: пустой хвост оставил бы модель без вопроса.
+    чистой. Чистой границы впереди может не быть вовсе: внутри длинной цепочки обращений к
+    инструментам последняя реплика человека осталась далеко позади, а всё после неё — пары
+    «обращение — результат». Тогда граница ищется НАЗАД, за бюджет: хвост выходит больше
+    обещанного, зато остаётся разговором. Прежний запасной ход — «взять последнее сообщение» —
+    отдавал ровно результат инструмента без своего обращения; чистилка запроса выбрасывала его
+    как сироту, и к модели уходил запрос вообще без сообщений, на который поставщик отвечает
+    отказом, а ход умирает целиком вместе со всей проделанной в нём работой. Переполненный
+    запрос лечится сжатием и повтором, пустой не лечится ничем.
     """
     if not messages:
         return []
@@ -129,11 +135,17 @@ def safe_tail(messages: list[dict], budget: int) -> list[dict]:
         if spent > budget and index != len(messages) - 1:
             break
         start = index
-    while start < len(messages) and not is_clean_boundary(messages, start):
-        start += 1
-    if start >= len(messages):
-        return messages[-1:]
-    return messages[start:]
+    forward = start
+    while forward < len(messages) and not is_clean_boundary(messages, forward):
+        forward += 1
+    if forward < len(messages):
+        return messages[forward:]
+    for back in range(min(start, len(messages) - 1), -1, -1):
+        if is_clean_boundary(messages, back):
+            return messages[back:]
+    # Чистой границы нет во всём разговоре (он сам начинается с обрывка цепочки) — отдаём его
+    # целиком: часть чистилка отбросит, но запрос не останется без единого сообщения.
+    return list(messages)
 
 
 def total_budget_for(window_tokens: int | None) -> int:
@@ -312,6 +324,42 @@ def _attach_to_current_question(tail: list[dict], dynamic: str) -> list[dict]:
     return tail
 
 
+def merge_into_system(system_head: list[dict], block: str) -> list[dict]:
+    """Влить блок в системную часть хозяина, а НЕ добавить вторым системным сообщением.
+
+    Сборщик запроса к Anthropic кладёт в поле системной части ПОСЛЕДНЕЕ системное сообщение, а
+    не все: второе системное сообщение вытесняет с провода личность хозяина (SOUL.md) — молча,
+    без ошибки и без предупреждения, так что заметно это только по тому, что агент отвечает
+    суше, чем он есть. Поэтому знание едет внутри той же системной части, следом за её текстом:
+    устойчивое начало сохраняется целиком, а кеш поставщика по-прежнему режется хозяином на
+    границе его собственного неизменного текста.
+    """
+    if not block:
+        return list(system_head)
+    if not system_head:
+        return [{"role": "system", "content": block}]
+    merged = list(system_head)
+    last = dict(merged[-1])
+    content = last.get("content")
+    if isinstance(content, list):
+        last["content"] = list(content) + [{"type": "text", "text": block}]
+    else:
+        text = content if isinstance(content, str) else str(content or "")
+        last["content"] = f"{text}\n\n{block}" if text else block
+    merged[-1] = last
+    return merged
+
+
+def is_conversation_message(message: dict) -> bool:
+    """Переживёт ли сообщение дорогу до модели — то есть будет ли в запросе разговор.
+
+    Системные сообщения уезжают в отдельное поле, а результат инструмента без своего обращения
+    хозяин выбрасывает как сироту. Если ничего, кроме них, в собранном запросе нет, до модели
+    доедет запрос без единого сообщения.
+    """
+    return not is_system(message) and not _is_tool_result(message)
+
+
 def assemble_with_anchor(
     system_head: list[dict],
     knowledge: str,
@@ -334,9 +382,7 @@ def assemble_with_anchor(
     spent += sum(message_size(m) for m in system_head)
     tail_budget = max(MIN_TAIL_BUDGET, total_budget - spent)
 
-    assembled = list(system_head)
-    if knowledge:
-        assembled.append({"role": "system", "content": knowledge})
+    assembled = merge_into_system(system_head, knowledge)
 
     # Сначала стареем, потом режем хвост: бюджет должен считаться по тому, что реально уйдёт.
     aged, aged_count = age_tool_results(conversation) if age_tools else (conversation, 0)

@@ -313,3 +313,55 @@ def test_the_window_of_the_model_sets_the_budget():
     eng.select_context(_request(), budget_tokens=200_000)
 
     assert eng.total_budget == 90_000
+
+
+# -- запрос без разговора ------------------------------------------------------------------
+
+
+def _long_tool_chain(pairs: int = 40, size: int = 4000) -> list[dict]:
+    """Разговор, каким он бывает в середине длинной работы: один вопрос и цепочка инструментов.
+
+    Так выглядела сессия, на которой Гермес 2026-09-22 четырежды получил отказ «в запросе нет
+    ни одного сообщения»: последняя реплика человека давно позади, всё после неё — пары
+    «обращение — результат», и бюджету хватает только на их конец.
+    """
+    chain: list[dict] = [
+        {"role": "system", "content": "личность"},
+        {"role": "user", "content": "разбери, почему падает сборка"},
+    ]
+    for index in range(pairs):
+        chain.append({"role": "assistant", "content": "",
+                      "tool_calls": [{"id": f"c{index}", "function": {"name": "read_file"}}]})
+        chain.append({"role": "tool", "tool_call_id": f"c{index}", "content": "х" * size})
+    return chain
+
+
+def test_a_long_tool_chain_never_leaves_the_request_without_a_conversation():
+    selected = _engine(_Store()).select_context(_long_tool_chain(), budget_tokens=200_000)
+
+    assert selected is not None
+    assert any(m.get("role") == "user" and not m.get("tool_call_id") for m in selected)
+
+
+def test_a_request_that_lost_its_conversation_is_handed_back_untouched(monkeypatch):
+    # Если сборка всё же вернёт одну системную часть, отправлять это нельзя: поставщик
+    # отвечает отказом, который не повторяют, и ход умирает целиком. Движок отходит в сторону.
+    import plugins.context_engine.aida as module
+
+    monkeypatch.setattr(module, "assemble_with_anchor",
+                        lambda *args, **kwargs: ([{"role": "system", "content": "только знание"}], None, 0))
+
+    assert _engine(_Store()).select_context(_request()) is None
+
+
+def test_the_personality_of_the_host_stays_on_the_wire():
+    # Знание внутри системной части хозяина, а не вторым системным сообщением: сборщик запроса
+    # к Anthropic оставляет только последнее системное сообщение.
+    store = _Store(knowledge=[{"content": "Оператор работает с ноутбука", "memory_type": "fact"}])
+
+    selected = _engine(store).select_context(_request())
+
+    systems = [m for m in selected if m.get("role") == "system"]
+    assert len(systems) == 1
+    assert systems[0]["content"].startswith("личность")
+    assert "Оператор работает с ноутбука" in systems[0]["content"]

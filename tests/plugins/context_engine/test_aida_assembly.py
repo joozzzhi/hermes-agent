@@ -96,12 +96,28 @@ def test_an_empty_conversation_produces_an_empty_tail():
     assert safe_tail([], 1000) == []
 
 
-def test_a_tail_made_entirely_of_tool_chatter_falls_back_to_the_last_message():
+def test_a_tail_made_entirely_of_tool_chatter_never_ends_up_a_lone_orphan():
+    # Прежде здесь отдавалось последнее сообщение — результат инструмента без своего
+    # обращения. Чистилка запроса выбрасывает такой результат как сироту, и к модели уходит
+    # запрос без единого сообщения: поставщик отвечает отказом, который не повторяют, и ход
+    # умирает целиком. Выйти за бюджет — меньшее зло.
     messages = [_calls_tool(), _tool_result(), _calls_tool(), _tool_result("второй")]
 
     tail = safe_tail(messages, 10)
 
-    assert len(tail) == 1 and tail[0]["content"] == "второй"
+    assert tail == messages
+
+
+def test_the_tail_steps_back_to_the_last_question_when_the_chain_has_no_clean_start():
+    # Бюджета хватает только на конец длинной цепочки, а чистая граница осталась позади:
+    # хвост должен начаться с реплики человека, а не с середины пары.
+    messages = [_user("почини сборку"), _calls_tool(), _tool_result("х" * 400),
+                _calls_tool(), _tool_result("у" * 400)]
+
+    tail = safe_tail(messages, 50)
+
+    assert tail[0] == _user("почини сборку")
+    assert is_clean_boundary(tail, 0)
 
 
 # -- слои ----------------------------------------------------------------------------------
@@ -167,8 +183,13 @@ def test_the_request_is_assembled_stable_first_changeable_with_the_question():
     assembled = assemble(system_head, "# Что я знаю всегда\n- живёт на ноуте",
                          "# Вспомнил\n- переезд в декабре", "", conversation)
 
-    assert assembled[0]["content"] == "личность"
-    assert assembled[1]["role"] == "system" and "знаю всегда" in assembled[1]["content"]
+    # Знание едет ВНУТРИ системной части хозяина, а не вторым системным сообщением: сборщик
+    # запроса к Anthropic оставляет только последнее системное сообщение, и второе стёрло бы
+    # личность с провода — молча, без ошибки.
+    assert assembled[0]["role"] == "system"
+    assert assembled[0]["content"].startswith("личность")
+    assert "знаю всегда" in assembled[0]["content"]
+    assert sum(1 for m in assembled if m.get("role") == "system") == 1
     assert "Вспомнил" in assembled[-1]["content"]
     assert assembled[-1]["content"].endswith("что там с переездом")
     assert assembled[-1]["role"] == "user"

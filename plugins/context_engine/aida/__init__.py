@@ -40,6 +40,7 @@ from .assembly import (
     build_knowledge_block,
     build_old_history_block,
     build_recalled_block,
+    is_conversation_message,
     message_key,
     message_size,
     safe_tail,
@@ -177,6 +178,14 @@ class AidaContextEngine(ContextEngine):
             assembled, new_anchor, aged_count = assemble_with_anchor(
                 system_head, knowledge, recalled, old_history, conversation,
                 total_budget=self.total_budget, anchor=anchor)
+            if conversation and not any(is_conversation_message(m) for m in assembled):
+                # До модели доехал бы запрос без единого сообщения, а на такой поставщик
+                # отвечает отказом, который не повторяют: ход умер бы целиком. Разговор у нас
+                # есть — значит, ошиблась сборка, и правильный ответ здесь один: отойти в
+                # сторону и дать хозяину отправить запрос так, как он отправил бы без движка.
+                logger.warning("Витрина: в собранном запросе не осталось разговора — "
+                               "запрос уходит как есть (сообщений было %d)", len(conversation))
+                return None
             if conversation_key is not None:
                 with self._lock:
                     grew = aged_count > self._aged_counts.get(conversation_key, 0)
