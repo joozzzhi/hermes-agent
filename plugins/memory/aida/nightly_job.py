@@ -37,13 +37,19 @@ except ImportError:  # запуск файлом, как его зовёт ра�
 # Сколько работы за один прогон. Ограничения стоят не ради скорости, а ради чужой квоты:
 # ключ к моделям общий с ботом, и его ответы человеку не должны её терять.
 MAX_TURNS_PER_RUN = 600
-MAX_EXCHANGES_PER_RUN = 80
+MAX_EXCHANGES_PER_RUN = 80  # доразбор старой очереди, оставшейся с однопроходной схемы
+MAX_TOPICS_PER_RUN = 60
 MAX_EMBEDDINGS_PER_RUN = 200
 EMBED_BATCH = 8
 
 # Короче этого — «ок», «ага», «поправляй». Порог взят у бота: он измерен на его переписке.
 MIN_EXCHANGE_LENGTH = 12
 MAX_FACTS_PER_EXCHANGE = 5
+MAX_FACTS_PER_TOPIC = 8
+
+# Сессия длиннее этого на разметку не идёт целиком — один вызов размётки должен читать
+# кусок, который влезает в голову модели за раз, а не весь день разговора.
+MAX_TURNS_PER_SEGMENT_CALL = 120
 
 # Ночь не торопится, а модель с рассуждением отвечает дольше, чем кажется: на двадцати
 # секундах разбор молча возвращал ноль, хотя модель работала (замер 21.09.2026).
@@ -75,7 +81,19 @@ OPENROUTER_MODELS = tuple(
 
 # Дословно тот же промпт, что у бота. Два разных определения «что стоит помнить» в одной
 # базе — это две разные памяти, между которыми человеку придётся выбирать.
-SYSTEM_PROMPT = """Ты — экстрактор фактов из диалога. Твоя задача — вытащить только то, что стоит помнить надолго.
+SEGMENT_SYSTEM_PROMPT = """Ты размечаешь кусок разговора на смысловые темы — блоки подряд идущих реплик,
+которые держатся вокруг одного предмета (одной задачи, решения, события).
+
+Верни ТОЛЬКО JSON-массив, без markdown, без пояснений, без обёрток.
+Формат каждого элемента:
+{"topic": "короткое название темы (3-8 слов)", "from_index": 0, "to_index": 4}
+
+from_index и to_index — это индексы реплик из списка ниже (0-based, включительно), которые входят в блок.
+Блоки идут по порядку и не пропускают реплики — каждая реплика входит ровно в один блок.
+Разговор ни о чём (приветствие, «ок», смена темы без сути) — тоже блок, просто мелкий.
+Если реплик мало и они об одном — верни один блок на все."""
+
+FACTS_SYSTEM_PROMPT = """Ты — экстрактор фактов из диалога. Твоя задача — вытащить только то, что стоит помнить надолго.
 
 Верни ТОЛЬКО JSON-массив, без markdown, без пояснений, без обёрток.
 Формат каждого элемента:
@@ -95,6 +113,9 @@ priority:
 
 Пиши content самодостаточно: он будет прочитан без диалога вокруг.
 Если извлекать нечего — верни []."""
+
+# Старое имя оставлено как алиас — на случай, если что-то ещё импортирует прежнее имя.
+SYSTEM_PROMPT = FACTS_SYSTEM_PROMPT
 
 
 def load_profile_env(hermes_home: Path) -> None:
@@ -139,15 +160,27 @@ def ship_turns(store, queue, limit: int = MAX_TURNS_PER_RUN) -> tuple[int, list[
     return len(shipped), shipped
 
 
-# ─── 2. Вытащить суть ─────────────────────────────────────────────────────────
+# ─── 2. Вытащить суть — двухпроходная схема ────────────────────────────────────
+#
+# Проход А (разметка): дешёвый разговор режется не по парам вопрос-ответ, а по смыслу —
+# несколько реплик подряд об одном деле превращаются в один блок с названием темы.
+# Один блок про решение "берём Гермеса", а не пять отдельных обменов внутри него.
+#
+# Проход Б (извлечение): каждый блок читается моделью целиком, единожды — вместо того
+# чтобы гонять модель на каждую пару реплик и терять связь между ними (кто на что отвечал).
 
 
-def build_exchanges(turns: Iterable[dict]) -> list[tuple[str, str, str]]:
-    """Сложить реплики обратно в обмены «человек → ответ», по каждому разговору отдельно."""
+def build_sessions(turns: Iterable[dict]) -> dict[str, list[dict]]:
+    """Сложить реплики обратно по разговорам, сохранив порядок внутри каждого."""
     by_session: dict[str, list[dict]] = {}
     for turn in turns:
         by_session.setdefault(turn["session_id"], []).append(turn)
+    return by_session
 
+
+def build_exchanges(turns: Iterable[dict]) -> list[tuple[str, str, str]]:
+    """Оставлено для доразбора старой очереди (pending_exchanges), см. distill_exchanges."""
+    by_session = build_sessions(turns)
     exchanges: list[tuple[str, str, str]] = []
     for session_id, session_turns in by_session.items():
         question = None
@@ -160,7 +193,128 @@ def build_exchanges(turns: Iterable[dict]) -> list[tuple[str, str, str]]:
     return exchanges
 
 
-def parse_facts(raw: str) -> list[dict]:
+def _format_turns_for_segmenting(turns: list[dict]) -> str:
+    lines = []
+    for i, turn in enumerate(turns):
+        who = "Человек" if turn["role"] == "user" else "Ассистент"
+        lines.append(f"[{i}] {who}: {turn['content']}")
+    return "\n\n".join(lines)
+
+
+def parse_segments(raw: str, n_turns: int) -> list[tuple[str, int, int]]:
+    """Достать разметку из ответа модели: список (тема, from_idx, to_idx) внутри [0, n_turns)."""
+    if not raw or n_turns <= 0:
+        return []
+    text = re.sub(r"```json|```", "", str(raw)).strip()
+    start, end = text.find("["), text.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        return []
+    try:
+        parsed = json.loads(text[start:end + 1])
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+
+    segments: list[tuple[str, int, int]] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        topic = str(item.get("topic") or "").strip()
+        try:
+            from_idx = int(item.get("from_index"))
+            to_idx = int(item.get("to_index"))
+        except (TypeError, ValueError):
+            continue
+        if not topic or from_idx < 0 or to_idx < from_idx or to_idx >= n_turns:
+            continue
+        segments.append((topic, from_idx, to_idx))
+    # Модель иногда путает границы соседних блоков — сортировка по началу восстанавливает
+    # порядок разговора, даже если сама разметка чуть промахнулась.
+    segments.sort(key=lambda s: s[1])
+    return segments
+
+
+def segment_session(session_id: str, turns: list[dict]) -> list[tuple[str, list[dict]]]:
+    """Проход А для одной сессии: разбить её реплики на смысловые блоки.
+
+    Длинная сессия режется на куски по MAX_TURNS_PER_SEGMENT_CALL реплик заранее — один
+    вызов модели должен видеть разговор целиком, а не половину дня разом.
+    """
+    blocks: list[tuple[str, list[dict]]] = []
+    for chunk_start in range(0, len(turns), MAX_TURNS_PER_SEGMENT_CALL):
+        chunk = turns[chunk_start:chunk_start + MAX_TURNS_PER_SEGMENT_CALL]
+        if not chunk:
+            continue
+        content = ask_model([
+            {"role": "system", "content": SEGMENT_SYSTEM_PROMPT},
+            {"role": "user", "content": _format_turns_for_segmenting(chunk)},
+        ])
+        segments = parse_segments(content, len(chunk)) if content else []
+        if not segments:
+            # Модель не разметила — весь кусок идёт одним блоком без названия темы,
+            # чтобы реплики не потерялись молча.
+            segments = [("разговор", 0, len(chunk) - 1)]
+        for topic, from_idx, to_idx in segments:
+            block_turns = chunk[from_idx:to_idx + 1]
+            if block_turns:
+                blocks.append((topic, block_turns))
+    return blocks
+
+
+def segment(queue, sessions: dict[str, list[dict]], limit: int = MAX_TOPICS_PER_RUN) -> int:
+    """Разметить привезённые сессии на темы и сложить блоки в очередь на извлечение."""
+    enqueued = 0
+    for session_id, turns in sessions.items():
+        if enqueued >= limit:
+            break
+        for topic, block_turns in segment_session(session_id, turns):
+            payload = [{"role": t["role"], "content": t["content"]} for t in block_turns]
+            if queue.enqueue_topic(session_id, topic, payload):
+                enqueued += 1
+    return enqueued
+
+
+def _format_topic_for_extraction(topic: str, turns: list[dict]) -> str:
+    lines = [f"Тема: {topic}", ""]
+    for turn in turns:
+        who = "Человек" if turn.get("role") == "user" else "Ассистент"
+        lines.append(f"{who}: {turn.get('content', '')}")
+    return "\n\n".join(lines)
+
+
+def distill_topics(store, queue, limit: int = MAX_TOPICS_PER_RUN) -> int:
+    """Проход Б: разобрать размеченные темой блоки и записать найденные факты.
+
+    Блок целиком идёт в модель одним вызовом — так факт вида «решили X после того как
+    обсудили Y и Z» не теряется, как терялся бы при разборе по одной паре реплик.
+    """
+    written = 0
+    unanswered = 0
+    for topic_row in queue.pending_topics(limit=limit):
+        turns = topic_row["turns"]
+        transcript = _format_topic_for_extraction(topic_row["topic"], turns)
+        if len(transcript.strip()) < MIN_EXCHANGE_LENGTH:
+            queue.release_topics([topic_row["id"]])
+            continue
+        content = ask_model([
+            {"role": "system", "content": FACTS_SYSTEM_PROMPT},
+            {"role": "user", "content": transcript},
+        ])
+        if not content:
+            unanswered += 1
+            continue
+        for fact in parse_facts(content, limit=MAX_FACTS_PER_TOPIC):
+            if store.save(fact["content"], memory_type=fact["type"], priority=fact["priority"],
+                          role="system", chat_id=source_tag("nightly"), embed=False):
+                written += 1
+        queue.release_topics([topic_row["id"]])
+    if unanswered:
+        print(f"  разбор: модель не ответила на {unanswered} тем — они разберутся в следующий раз")
+    return written
+
+
+def parse_facts(raw: str, limit: int = MAX_FACTS_PER_EXCHANGE) -> list[dict]:
     """Достать массив из ответа модели. Дешёвые модели заворачивают JSON в прозу и в забор."""
     if not raw:
         return []
@@ -187,7 +341,7 @@ def parse_facts(raw: str) -> list[dict]:
             "type": normalise_type(item.get("type")),
             "priority": "P1" if item.get("priority") == "P1" else "P2",
         })
-        if len(facts) >= MAX_FACTS_PER_EXCHANGE:
+        if len(facts) >= limit:
             break
     return facts
 
@@ -270,8 +424,12 @@ def _model_targets() -> list[dict]:
     return targets
 
 
-def distill(store, queue, limit: int = MAX_EXCHANGES_PER_RUN) -> int:
-    """Разобрать ждущие обмены и положить найденное в общую базу.
+def distill_exchanges(store, queue, limit: int = MAX_EXCHANGES_PER_RUN) -> int:
+    """Доразобрать хвост старой однопроходной очереди (pending_exchanges).
+
+    Новые разговоры туда больше не попадают — их с этой ночи размечает segment().
+    Функция остаётся, пока в очереди могут лежать обмены, поставленные до перехода на
+    двухпроходную схему; когда pending_exchanges опустеет насовсем, её можно будет убрать.
 
     Обмен покидает очередь, только когда модель на него ответила. Не ответила — он ждёт
     следующей ночи: реплики к тому времени уже в базе, и разобрать их иначе было бы нечем.
@@ -341,14 +499,28 @@ def run(hermes_home: Path) -> int:
     try:
         waiting = queue.count()
         shipped, turns = ship_turns(store, queue)
-        for session_id, question, answer in build_exchanges(turns):
-            queue.enqueue_exchange(session_id, question, answer)
-        facts = distill(store, queue)
+        sessions = build_sessions(turns)
+
+        # Проход А: разметить привезённый разговор на темы и сложить блоки в очередь.
+        topics_enqueued = segment(queue, sessions)
+
+        # Проход Б: разобрать размеченные темой блоки на факты.
+        facts = distill_topics(store, queue)
+
+        # Хвост старой очереди — обмены, поставленные до перехода на двухпроходную схему.
+        # Как только она опустеет, distill_exchanges будет всегда возвращать 0 бесплатно.
+        old_exchanges_left = queue.count_exchanges()
+        if old_exchanges_left:
+            facts += distill_exchanges(store, queue)
+
         filled, left = backfill_embeddings(store)
 
         print("Ночная работа общей памяти")
         print(f"  разговор: довезено {shipped} реплик из {waiting}, ждут ещё {queue.count()}")
-        print(f"  суть: записано фактов — {facts}, ждут разбора {queue.count_exchanges()} обменов")
+        print(f"  темы: размечено {topics_enqueued} блоков, ждут разбора {queue.count_topics()}")
+        if old_exchanges_left:
+            print(f"  старая очередь: доразобрано {old_exchanges_left}, осталось {queue.count_exchanges()}")
+        print(f"  суть: записано фактов — {facts}")
         print(f"  поиск по смыслу: дозаполнено {filled}, осталось без него {left}")
         if not store.alive():
             print("  база в эту ночь была недоступна — всё, что не доехало, ждёт в очереди")

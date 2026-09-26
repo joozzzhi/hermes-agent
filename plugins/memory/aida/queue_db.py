@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import json
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -34,6 +35,19 @@ CREATE TABLE IF NOT EXISTS pending_exchanges (
   session_id TEXT NOT NULL,
   question TEXT NOT NULL,
   answer TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Темы, размеченные внутри одной сессии, ждут разбора по каждой теме целиком (а не по
+-- обмену за обменом): одна модельная разметка режет день на смысловые блоки, каждый блок
+-- потом разбирается отдельным вызовом. ``turns_json`` хранит сами реплики блока
+-- (role+content), а не только границы id — блок остаётся самодостаточным для разбора,
+-- даже если сессия к тому моменту уже очищена от исходных pending_turns.
+CREATE TABLE IF NOT EXISTS pending_topics (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  topic TEXT NOT NULL,
+  turns_json TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
@@ -130,6 +144,56 @@ class TurnQueue:
     def count_exchanges(self) -> int:
         with self._lock:
             return int(self._conn.execute("SELECT count(*) FROM pending_exchanges").fetchone()[0])
+
+    # -- темы, ждущие разбора -------------------------------------------------------------
+
+    def enqueue_topic(self, session_id: str, topic: str, turns: list[dict[str, str]]) -> bool:
+        """One segmented block: a topic label plus the turns (role+content) inside it.
+
+        Empty turns mean the segmenter drew a block with nothing in it — that's a malformed
+        answer, not a topic, and is not worth a row.
+        """
+        topic = (topic or "").strip()
+        if not topic or not turns:
+            return False
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO pending_topics (session_id, topic, turns_json) VALUES (?, ?, ?)",
+                (session_id or "session", topic, json.dumps(turns, ensure_ascii=False)),
+            )
+            self._conn.commit()
+        return True
+
+    def pending_topics(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, session_id, topic, turns_json FROM pending_topics ORDER BY id LIMIT ?",
+                (limit,),
+            ).fetchall()
+        result = []
+        for row in rows:
+            try:
+                turns = json.loads(row[3])
+            except Exception:
+                turns = []
+            result.append({"id": row[0], "session_id": row[1], "topic": row[2], "turns": turns})
+        return result
+
+    def release_topics(self, ids: Iterable[int]) -> int:
+        ids = [int(i) for i in ids]
+        if not ids:
+            return 0
+        with self._lock:
+            placeholders = ",".join("?" for _ in ids)
+            cursor = self._conn.execute(
+                f"DELETE FROM pending_topics WHERE id IN ({placeholders})", ids
+            )
+            self._conn.commit()
+            return cursor.rowcount
+
+    def count_topics(self) -> int:
+        with self._lock:
+            return int(self._conn.execute("SELECT count(*) FROM pending_topics").fetchone()[0])
 
     def close(self) -> None:
         with self._lock:

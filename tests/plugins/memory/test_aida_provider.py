@@ -424,3 +424,36 @@ def test_teardown_releases_the_database_and_waits_for_a_running_recall():
 
     assert store.closed is True
     assert not provider._thread.is_alive()
+
+
+# -- когда контекст собирает движок --------------------------------------------------------
+
+
+def test_memory_stops_searching_when_the_context_engine_took_that_over(tmp_path):
+    # Две копии одного и того же найденного в запросе — это плата дважды: временем и
+    # чужой квотой. Ищет кто-то один.
+    from plugins.memory.aida import recall_signal
+
+    store = _FakeStore([_memory()])
+    provider = _provider(store)
+    try:
+        recall_signal.announce_engine()
+        provider.queue_prefetch("что там с переездом")
+
+        assert provider._thread is None
+        assert store.queries == []
+    finally:
+        recall_signal.reset()
+
+
+def test_the_indicator_still_shows_what_the_engine_raised():
+    from plugins.memory.aida import recall_signal
+
+    provider = _provider(_FakeStore())
+    try:
+        recall_signal.announce_engine()
+        recall_signal.publish(3)
+
+        assert provider.recall_status().count == 3
+    finally:
+        recall_signal.reset()

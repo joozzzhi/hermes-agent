@@ -103,6 +103,27 @@ REMEMBER_SCHEMA = {
     },
 }
 
+def _turn_called_remember(messages: list[dict[str, Any]] | None) -> bool:
+    """Did this turn's transcript include a call to ``aida_remember``?
+
+    ``messages`` is the turn's full projected transcript (OpenAI tool-call shape), not just
+    the final text — a call earlier in the turn is exactly the case this guards against.
+    Anything unexpected in the shape is treated as "no call": staying silent here only
+    costs a duplicate, never a lost fact, and the nightly distiller is not the place to be
+    strict about malformed input.
+    """
+    if not messages:
+        return False
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            name = (call or {}).get("function", {}).get("name") if isinstance(call, dict) else None
+            if name == REMEMBER_SCHEMA["name"]:
+                return True
+    return False
+
+
 RECALL_SCHEMA = {
     "name": "aida_recall",
     "description": (
@@ -460,13 +481,22 @@ class AidaMemoryProvider(MemoryProvider):
 
     # -- writing -----------------------------------------------------------------------
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", **kwargs) -> None:
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "",
+                  messages: list[dict[str, Any]] | None = None, **kwargs) -> None:
         """Keep the turn locally; the nightly job carries it to the shared store.
 
         Nothing here talks to the database — an answer must not wait on the network, and a
         day's conversation is worth one batch rather than two round trips per reply.
+
+        A turn where the agent already called ``aida_remember`` on itself is skipped here:
+        that write is already in the store, deliberate and phrased by the agent. Queuing the
+        same turn would hand it to the nightly distiller a second time, which reads it fresh
+        and words it differently — the dedup in ``write.py`` matches on exact text, so a
+        second phrasing of the same fact would sail right past it and double up in recall.
         """
         if self._queue is None or not self._writes_enabled:
+            return
+        if _turn_called_remember(messages):
             return
         session = session_id or self._session_id
         try:

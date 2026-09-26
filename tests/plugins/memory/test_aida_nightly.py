@@ -273,7 +273,7 @@ def test_an_exchange_the_model_could_not_answer_waits_for_the_next_night(tmp_pat
     queue = _queue(tmp_path, [])
     queue.enqueue_exchange("s1", "длинный вопрос про переезд в декабре", "ответ")
 
-    assert nightly_job.distill(store, queue) == 0
+    assert nightly_job.distill_exchanges(store, queue) == 0
     assert queue.count_exchanges() == 1
     assert "модель не ответила" in capsys.readouterr().out
     queue.close()
@@ -285,7 +285,7 @@ def test_a_short_exchange_is_not_worth_a_model_call(tmp_path, monkeypatch):
     queue = _queue(tmp_path, [])
     queue.enqueue_exchange("s1", "ок", "ага")
 
-    assert nightly_job.distill(store, queue) == 0
+    assert nightly_job.distill_exchanges(store, queue) == 0
     assert queue.count_exchanges() == 0  # короткий обмен отпущен, а не копится вечно
     queue.close()
 
@@ -299,7 +299,7 @@ def test_an_exchange_that_was_distilled_is_not_distilled_again(tmp_path, monkeyp
     queue = _queue(tmp_path, [])
     queue.enqueue_exchange("s1", "длинный вопрос про переезд в декабре", "ответ")
 
-    assert nightly_job.distill(store, queue) == 1
+    assert nightly_job.distill_exchanges(store, queue) == 1
     assert store.saved[0]["content"] == "Переезд в декабре"
     assert store.saved[0]["priority"] == "P1"
     assert queue.count_exchanges() == 0
@@ -315,7 +315,7 @@ def test_a_fact_found_at_night_is_left_for_the_batch_that_fills_in_meaning_searc
     queue = _queue(tmp_path, [])
     queue.enqueue_exchange("s1", "длинный вопрос про переезд в декабре", "ответ")
 
-    nightly_job.distill(store, queue)
+    nightly_job.distill_exchanges(store, queue)
 
     assert store.saved[0]["embed"] is False
     queue.close()
