@@ -228,6 +228,26 @@ class TestProviderEnvBlocklist:
         for var in leaked_vars:
             assert var not in result_env, f"{var} leaked into subprocess env"
 
+    def test_memory_and_context_engine_plugin_secrets_are_stripped(self):
+        """Every env var an in-tree memory / context-engine plugin declares in
+        ``requires_env`` (e.g. SUPABASE_DB_URL, a DSN with a password) plus the
+        generic database DSNs must not reach terminal children."""
+        import yaml
+
+        plugins_root = Path(__file__).resolve().parents[2] / "plugins"
+        declared = set()
+        for manifest in [*plugins_root.glob("memory/*/plugin.yaml"),
+                         *plugins_root.glob("context_engine/*/plugin.yaml")]:
+            for entry in (yaml.safe_load(manifest.read_text(encoding="utf-8")) or {}).get("requires_env") or []:
+                declared.add(entry if isinstance(entry, str) else entry.get("name"))
+        declared.discard(None)
+        leaked = {name: "postgresql://u:fake-pw@db.example:5432/x" for name in
+                  declared | {"SUPABASE_DB_URL", "DATABASE_URL"}}
+
+        result_env = _run_with_env(extra_os_env=leaked)
+
+        assert not set(leaked) & set(result_env)
+
     def test_safe_vars_are_preserved(self):
         """Standard env vars (PATH, HOME, USER) must still be passed through."""
         result_env = _run_with_env()

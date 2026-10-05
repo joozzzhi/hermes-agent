@@ -38,7 +38,36 @@ _STATIC_PROVIDER_ENV_BLOCKLIST = frozenset({
     "DAYTONA_API_KEY", "GATEWAY_RELAY_ID", "GATEWAY_RELAY_SECRET",
     "GATEWAY_RELAY_DELIVERY_KEY", "VERCEL_OIDC_TOKEN", "VERCEL_TOKEN",
     "VERCEL_PROJECT_ID", "VERCEL_TEAM_ID",
+    # Database DSNs embed the password in the URL (memory/context-engine backends).
+    "DATABASE_URL", "SUPABASE_DB_URL",
 })
+
+# In-tree plugin kinds whose ``requires_env`` names are Hermes-owned backend credentials.
+_CREDENTIAL_PLUGIN_KINDS = ("memory", "context_engine")
+
+
+def _bundled_plugin_required_env() -> set[str]:
+    """``requires_env`` names declared by bundled memory / context-engine plugins
+    (plain names or ``{name: ...}`` dicts). Fail-soft per manifest."""
+    import yaml
+
+    from plugins import plugin_loader
+    from utils import fast_safe_load
+
+    names: set[str] = set()
+    for kind in _CREDENTIAL_PLUGIN_KINDS:
+        for plugin_dir in plugin_loader.iter_plugin_dirs(plugin_loader._PLUGINS_ROOT / kind):
+            try:
+                data = fast_safe_load((plugin_dir / "plugin.yaml").read_text(encoding="utf-8")) or {}
+            except (OSError, yaml.YAMLError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            for entry in data.get("requires_env") or []:
+                name = entry.get("name") if isinstance(entry, dict) else entry
+                if isinstance(name, str) and name:
+                    names.add(name)
+    return names
 
 
 def _build_provider_env_blocklist() -> frozenset:
@@ -61,6 +90,10 @@ def _build_provider_env_blocklist() -> frozenset:
             if category in {"tool", "messaging"} or (
                     category == "setting" and metadata.get("password")):
                 blocked.add(name)
+    except ImportError:
+        pass
+    try:
+        blocked.update(_bundled_plugin_required_env())
     except ImportError:
         pass
     # CLAUDE_CODE_OAUTH_TOKEN (via the anthropic registry entry) belongs to the user's
