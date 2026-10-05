@@ -416,6 +416,48 @@ def test_a_written_turn_still_waits_in_the_local_queue_to_be_distilled(tmp_path)
     provider._queue.close()
 
 
+_FAKE_OR_KEY = "sk-or-v1-" + "0123456789abcdef" * 4
+
+
+def test_a_secret_said_in_a_turn_never_reaches_the_queue_in_clear(tmp_path):
+    """Raw turns travel to Postgres, the embedding service and the nightly distiller;
+    a credential pasted into the conversation must be masked before it is kept at all."""
+    from plugins.memory.aida.queue_db import TurnQueue
+
+    provider = _provider(_RecordingStore())
+    provider._queue = TurnQueue(tmp_path / "queue.db")
+
+    provider.sync_turn(f"мой ключ {_FAKE_OR_KEY}, сохрани", f"принял {_FAKE_OR_KEY}", session_id="s")
+    provider._queue.enqueue_exchange("s", f"ключ {_FAKE_OR_KEY}", "ок, запомнил")
+    provider._queue.enqueue_topic("s", "ключи", [{"role": "user", "content": f"вот {_FAKE_OR_KEY}"}])
+
+    stored = (tmp_path / "queue.db").read_bytes().decode("utf-8", "ignore")
+    assert _FAKE_OR_KEY not in stored
+    assert _FAKE_OR_KEY[-16:] not in stored
+    assert [row["role"] for row in provider._queue.pending()] == ["user", "assistant"]
+
+
+def test_a_secret_never_leaves_for_the_database_or_the_embedder_in_clear(monkeypatch):
+    sent: list = []
+    store = _Store("postgresql://u@h/db", api_key="fake")
+    monkeypatch.setattr(store, "_execute", lambda sql, params: sent.append(params) or ([] if "SELECT" in sql else [(1,)]))
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"data": [{"embedding": [0.1]}]}
+
+    import requests
+    monkeypatch.setattr(requests, "post", lambda url, **kw: sent.append(kw["json"]) or _Resp())
+
+    assert store.save(f"ключ бота {_FAKE_OR_KEY}", embed=False) == [1]
+    store.embed_many([f"ключ {_FAKE_OR_KEY}"])
+
+    assert sent and _FAKE_OR_KEY not in repr(sent) and _FAKE_OR_KEY[-16:] not in repr(sent)
+
+
 def test_with_the_store_down_the_turn_waits_unshipped_in_the_queue(tmp_path):
     from plugins.memory.aida.queue_db import TurnQueue
 
