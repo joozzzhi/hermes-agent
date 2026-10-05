@@ -150,6 +150,9 @@ _PREFIX_PATTERNS = [
     r"xapp-\d+-[A-Za-z0-9-]{10,}",      # Slack app-Level token
     r"xox[baprs]-[A-Za-z0-9-]{10,}",    # Slack bot/app/user tokens
     r"AIza[A-Za-z0-9_-]{30,}",          # Google API keys
+    r"AQ\.[A-Za-z0-9_-]{40,}",          # Google API keys (new ``AQ.`` format)
+    r"sbp_[A-Za-z0-9]{20,}",            # Supabase personal access token
+    r"sb_secret_[A-Za-z0-9_-]{20,}",    # Supabase secret API key
     r"pplx-[A-Za-z0-9]{10,}",           # Perplexity
     r"fal_[A-Za-z0-9_-]{10,}",          # Fal.ai
     r"fc-[A-Za-z0-9]{10,}",             # Firecrawl
@@ -1166,12 +1169,23 @@ def redact_terminal_output(output: str, command: str | None = None, *, force: bo
 # silently break the gate (every match contains its pattern's literal prefix).
 
 def _extract_literal_prefix(pattern: str) -> str:
-    """Leading literal chars of a regex (up to the first metacharacter)."""
+    """Leading literal chars of a regex (up to the first metacharacter). An escaped
+    punctuation char (``\\.`` in ``AQ\\.``) is a literal and stays in the prefix."""
     meta = "[(\\.?*+|{^$"
-    for i, ch in enumerate(pattern):
+    out, i = [], 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "\\" and i + 1 < len(pattern) and not pattern[i + 1].isalnum():
+            if pattern[i + 2:i + 3] in ("?", "*", "{"):
+                break  # optional / repeated: not a guaranteed literal
+            out.append(pattern[i + 1])
+            i += 2
+            continue
         if ch in meta:
-            return pattern[:i]
-    return pattern
+            break
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _skip_char_class(pattern: str, i: int) -> int:

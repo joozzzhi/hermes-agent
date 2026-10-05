@@ -1588,3 +1588,34 @@ class TestRedactForEgress:
         from agent import redact as R
         monkeypatch.setattr(R, "redact_sensitive_text", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
         assert R.redact_for_egress("sk-live-0123456789abcdef") == R.REDACTION_UNAVAILABLE
+
+
+class TestGoogleAqAndSupabaseKeys:
+    """New-format Google API keys (``AQ.`` + 40+ body chars) and Supabase access /
+    secret keys must be masked on every surface, including inside a URL query."""
+
+    _KEYS = (
+        "AQ." + "Ab8RN6" + "x" * 20 + "_-" + "9" * 22,
+        "sbp_" + "a1B2c3D4" * 5,
+        "sb_secret_" + "Zz9_-yY8" * 4,
+    )
+
+    @pytest.mark.parametrize("key", _KEYS)
+    def test_masked_bare_json_and_url_query_in_every_mode(self, key):
+        from agent.redact import redact_for_egress
+
+        samples = (
+            f"here is the key {key} ok",
+            '{"api_key_value": "' + key + '"}',
+            f"GET https://generativelanguage.example/v1/models?alt=json&key={key}",
+        )
+        for text in samples:
+            for out in (redact_sensitive_text(text, force=True),
+                        redact_sensitive_text(text, force=True, code_file=True),
+                        redact_for_egress(text)):
+                assert key not in out
+                assert key[-12:] not in out
+
+    def test_aq_prose_and_short_tokens_untouched(self):
+        prose = "See FAQ.md and AQ.short for the Q&A. AQ.Index is fine."
+        assert redact_sensitive_text(prose, force=True) == prose
