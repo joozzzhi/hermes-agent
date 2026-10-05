@@ -601,12 +601,14 @@ def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
 
 def scan_skill(skill_path: Path, source: str = "community") -> ScanResult:
     """Structural checks + pattern scan of every text file in a skill dir (or a single file). A gitignore-style
-    `.skillignore` / `.clawhubignore` excludes dev/docs artifacts from BOTH passes; the ignore file itself is
-    always excluded and `SKILL.md` can never be un-ignored. *source* (e.g. "openai/skills") sets the trust level."""
+    `.skillignore` / `.clawhubignore` excludes dev/docs artifacts from BOTH passes — only for builtin/trusted
+    sources: the ignore file is author-controlled, so for community/agent-created skills it would let the author
+    hide a payload from the scan. The ignore file itself is always excluded and `SKILL.md` can never be
+    un-ignored. *source* (e.g. "openai/skills") sets the trust level."""
     name, trust = skill_path.name, _resolve_trust_level(source)
     findings: List[Finding] = []
     if skill_path.is_dir():
-        ignore = _load_skill_ignore(skill_path)
+        ignore = _load_skill_ignore(skill_path) if trust in _IGNORE_HONOURING_TRUST else _scan_everything
         findings.extend(_check_structure(skill_path, ignore=ignore))
         for f in skill_path.rglob("*"):
             if f.is_file() and not ignore(rel := str(f.relative_to(skill_path))):
@@ -750,6 +752,12 @@ def _check_structure(skill_dir: Path, ignore=None) -> List[Finding]:
 
 # `.skillignore` is Hermes-native; `.clawhubignore` is honored for skills published through ClawHub.
 _SKILL_IGNORE_FILENAMES = (".skillignore", ".clawhubignore")
+# Trust levels whose author-controlled ignore file may narrow the scan (see ``scan_skill``).
+_IGNORE_HONOURING_TRUST = frozenset({"builtin", "trusted"})
+
+
+def _scan_everything(rel: str) -> bool:
+    return False
 
 
 def _load_skill_ignore(skill_dir: Path):
