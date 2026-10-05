@@ -13,7 +13,7 @@ from urllib.parse import unquote_plus
 
 # Shared with agent/file_safety's read-block list so the two defenses can't
 # drift: a blocked file_tools read that falls back to ``cat`` is still caught.
-from agent.file_safety import _BLOCKED_PROJECT_ENV_BASENAMES as _ENV_FILE_BASENAMES
+from agent.file_safety import is_secret_env_basename
 
 logger = logging.getLogger(__name__)
 
@@ -1081,7 +1081,7 @@ def _is_secret_file_arg(arg: str) -> bool:
     parts = [part.lower() for part in path.split("/") if part]
     if not parts:
         return False
-    if parts[-1] in _ENV_FILE_BASENAMES or parts[-1] in _SHELL_RC_BASENAMES:
+    if is_secret_env_basename(parts[-1]) or parts[-1] in _SHELL_RC_BASENAMES:
         return True
     # ``config.yaml`` plus the ``config.yaml.good.<stamp>`` / ``.corrupt.<stamp>`` copies Hermes
     # writes under ``backups/config/`` — same contents, same secrets.

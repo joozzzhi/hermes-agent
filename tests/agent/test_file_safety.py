@@ -59,6 +59,22 @@ class TestEnvFileReadBlocking:
         error = get_read_block_error("/tmp/project/.env.example")
         assert error is None
 
+    @pytest.mark.parametrize("basename", [".env.bak-20260921", ".env.backup", ".env.old", ".ENV.Prod.Bak"])
+    def test_env_backup_copies_blocked_like_env_and_secret_to_redactor(self, basename):
+        """A backup/rotated copy of ``.env`` holds the same secrets: read_file blocks it and the
+        terminal redactor treats ``cat`` of it as a secret-file read."""
+        from agent.redact import _is_secret_file_arg
+
+        assert get_read_block_error(f"/tmp/project/{basename}") is not None
+        assert _is_secret_file_arg(f"/tmp/project/{basename}")
+
+    @pytest.mark.parametrize("basename", [".env.example", ".env.sample", ".env.template", ".env.dist"])
+    def test_env_templates_stay_readable_and_not_secret(self, basename):
+        from agent.redact import _is_secret_file_arg
+
+        assert get_read_block_error(f"/tmp/project/{basename}") is None
+        assert not _is_secret_file_arg(f"/tmp/project/{basename}")
+
 
 
 

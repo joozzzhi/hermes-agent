@@ -310,6 +310,17 @@ def is_write_approval_required(path: str) -> bool:
 _BLOCKED_PROJECT_ENV_BASENAMES: set[str] = {
     ".env", ".env.local", ".env.development", ".env.production", ".env.test", ".env.staging", ".envrc",
 }
+# Documented-shape templates: ``.env.<suffix>`` names that carry no real values.
+_ENV_TEMPLATE_BASENAMES = frozenset({".env.example", ".env.sample", ".env.template", ".env.dist"})
+
+
+def is_secret_env_basename(name: str) -> bool:
+    """True for ``.env``, ``.envrc`` and every ``.env.<suffix>`` copy (``.env.bak-<stamp>``,
+    ``.env.old``, ...) except the template names. Case-insensitive."""
+    lower = name.lower()
+    if lower in _BLOCKED_PROJECT_ENV_BASENAMES:
+        return True
+    return lower.startswith(".env.") and lower not in _ENV_TEMPLATE_BASENAMES
 
 _DID_SUFFIX = (
     " (Defense-in-depth — not a security boundary; the terminal tool can still bypass.)"
@@ -381,7 +392,7 @@ def get_read_block_error(path: str) -> Optional[str]:
                     break
             if reason:
                 break
-        if reason is None and resolved.name.lower() in _BLOCKED_PROJECT_ENV_BASENAMES:
+        if reason is None and is_secret_env_basename(resolved.name):
             reason = (
                 "is a secret-bearing environment file and cannot be read to prevent credential "
                 "leakage. If you need to check the file structure, read .env.example instead." + _DID_SUFFIX
