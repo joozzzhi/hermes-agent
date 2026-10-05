@@ -411,6 +411,23 @@ class TestWriteFile:
         assert result["success"] is True
         assert (tmp_path / "my-skill" / "references" / "api.md").exists()
 
+    @pytest.mark.parametrize("file_path", [
+        "C:SKILL.md", "C:/x/SKILL.md", "/abs/references/x.md", "C:references/x.md",
+        "foo/SKILL.md", "references/SKILL.md", "references/sub/skill.md",
+    ])
+    def test_write_rejects_rooted_paths_and_nested_skill_md(self, tmp_path, file_path):
+        """write_file only places supporting files: a drive/root-anchored path or a nested
+        SKILL.md (a new skill hidden inside another, skipping the create-path scan) is refused
+        and leaves the skill tree untouched."""
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            before = sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*"))
+            result = _write_file("my-skill", file_path, "---\nname: evil\ndescription: x\n---\nbody\n")
+            after = sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*"))
+        assert result["success"] is False
+        assert before == after
+        assert (tmp_path / "my-skill" / "SKILL.md").read_text() == VALID_SKILL_CONTENT
+
     def test_write_symlink_escape_blocked(self, tmp_path):
         outside_dir = tmp_path / "outside"
         outside_dir.mkdir()

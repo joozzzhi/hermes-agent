@@ -316,16 +316,25 @@ def _skill_not_found_error(name: str, suffix: str = "") -> str:
 
 def _validate_file_path(file_path: str) -> Optional[str]:
     """Validate a write_file/remove_file path: under an allowed subdir, no escape."""
+    from pathlib import PurePosixPath, PureWindowsPath
     from tools.path_security import has_traversal_component
     if not file_path:
         return "file_path is required."
+    # Checked as data on every host: ``C:SKILL.md`` (drive-relative) is a plain name on POSIX
+    # but escapes the skill dir on Windows.
+    win = PureWindowsPath(file_path)
+    if win.drive or win.anchor or PurePosixPath(file_path).is_absolute():
+        return f"file_path must be relative to the skill directory. Got: '{file_path}'"
     parts = Path(file_path).parts
     # Traversal first, so the SKILL.md exception is unreachable by a traversal-laden path.
     if has_traversal_component(file_path):
         return "Path traversal ('..') is not allowed."
-    # SKILL.md lives at the skill root; accept 'SKILL.md' and '<skill>/SKILL.md'.
-    if parts and parts[-1] == "SKILL.md" and len(parts) in (1, 2):
-        return None
+    # Only the skill's own root SKILL.md; a nested one would be a new skill inside this one.
+    if parts and parts[-1].lower() == "skill.md":
+        if len(parts) == 1 and parts[0] == "SKILL.md":
+            return None
+        return ("SKILL.md is only allowed at the skill root; create a new skill with "
+                f"action='create' instead. Got: '{file_path}'")
     if not parts or parts[0] not in ALLOWED_SUBDIRS:
         allowed = ", ".join(sorted(ALLOWED_SUBDIRS))
         return f"File must be under one of: {allowed}. Got: '{file_path}'"
