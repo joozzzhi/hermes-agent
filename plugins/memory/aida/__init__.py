@@ -114,7 +114,16 @@ def _turn_called_remember(messages: list[dict[str, Any]] | None) -> bool:
     """
     if not messages:
         return False
-    for message in messages:
+    # ``messages`` is the WHOLE conversation, not this turn: one aida_remember a week ago would
+    # otherwise mark every later turn of a long-lived chat as "already saved" and nothing from
+    # it would ever reach the store again. This turn starts at the last real user message.
+    start = 0
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if isinstance(message, dict) and message.get("role") == "user" and message.get("tool_call_id") is None:
+            start = index
+            break
+    for message in messages[start:]:
         if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
         for call in message.get("tool_calls") or []:

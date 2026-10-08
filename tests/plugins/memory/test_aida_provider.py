@@ -457,3 +457,16 @@ def test_the_indicator_still_shows_what_the_engine_raised():
         assert provider.recall_status().count == 3
     finally:
         recall_signal.reset()
+
+
+def test_an_old_remember_in_a_long_chat_does_not_silence_every_later_turn():
+    """Regression: sync_turn gets the whole conversation, so a remember call from an earlier
+    turn must not mark the current one as already saved (it stopped all nightly shipping)."""
+    remember = {"role": "assistant", "tool_calls": [{"function": {"name": "aida_remember"}}]}
+    earlier = [{"role": "user", "content": "a"}, remember,
+               {"role": "tool", "tool_call_id": "1", "content": "ok"},
+               {"role": "assistant", "content": "x"}]
+    plain_turn = earlier + [{"role": "user", "content": "b"}, {"role": "assistant", "content": "y"}]
+    remember_turn = earlier + [{"role": "user", "content": "b"}, remember]
+    assert aida._turn_called_remember(plain_turn) is False
+    assert aida._turn_called_remember(remember_turn) is True
