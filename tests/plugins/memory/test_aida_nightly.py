@@ -11,8 +11,9 @@ class _Store:
 
     def __init__(self, *, down: bool = False, duplicates: set[str] | None = None,
                  rows_without_vector: list[tuple] | None = None, vectors: list | None = None,
-                 unembeddable: set[str] | None = None):
+                 unembeddable: set[str] | None = None, known: set[str] | None = None):
         self.down = down
+        self.known = known or set()
         self.unembeddable = unembeddable or set()
         self.duplicates = duplicates or set()
         self.saved: list[dict] = []
@@ -22,12 +23,16 @@ class _Store:
         self.embed_calls: list[list[str]] = []
 
     def save(self, content, *, memory_type="fact", priority="P2", role="assistant",
-             chat_id="", embed=True):
+             chat_id="", embed=True, created_at=None, dedupe=True):
         if self.down or content in self.duplicates:
             return []
         self.saved.append({"content": content, "memory_type": memory_type,
-                           "priority": priority, "role": role, "chat_id": chat_id, "embed": embed})
+                           "priority": priority, "role": role, "chat_id": chat_id, "embed": embed,
+                           "created_at": created_at, "dedupe": dedupe})
         return [len(self.saved)]
+
+    def knows(self, content):
+        return content in self.known
 
     def alive(self):
         return not self.down
@@ -63,7 +68,7 @@ def _queue(tmp_path, turns):
 # -- довоз дословного --------------------------------------------------------------------
 
 
-def test_the_day_s_conversation_reaches_the_shared_memory_word_for_word(tmp_path):
+def test_late_turns_reach_the_shared_memory_word_for_word_as_dialogue(tmp_path):
     store = _Store()
     queue = _queue(tmp_path, [("s1", "user", "что там с переездом"), ("s1", "assistant", "в декабре")])
 
@@ -71,8 +76,32 @@ def test_the_day_s_conversation_reaches_the_shared_memory_word_for_word(tmp_path
 
     assert shipped == 2
     assert [row["content"] for row in store.saved] == ["что там с переездом", "в декабре"]
-    assert all(row["memory_type"] == "dialogue" and row["priority"] == "P2" for row in store.saved)
-    assert queue.count() == 0
+    assert all(row["memory_type"] == "dialogue" and row["priority"] == "P3" for row in store.saved)
+    assert queue.unshipped() == []
+    # A delivered turn still waits in the queue — to be distilled.
+    assert queue.count() == 2
+    queue.close()
+
+
+def test_a_late_turn_is_dated_by_when_it_was_said_not_when_it_was_delivered(tmp_path):
+    store = _Store()
+    queue = _queue(tmp_path, [("s1", "user", "что там с переездом")])
+    said = queue.pending()[0]["created_at"]
+
+    nightly_job.ship_turns(store, queue)
+
+    assert store.saved[0]["created_at"].startswith(said)
+    queue.close()
+
+
+def test_a_line_said_twice_is_kept_twice(tmp_path):
+    store = _Store()
+    queue = _queue(tmp_path, [("s1", "user", "да"), ("s1", "user", "да")])
+
+    nightly_job.ship_turns(store, queue)
+
+    assert [row["content"] for row in store.saved] == ["да", "да"]
+    assert all(row["dedupe"] is False for row in store.saved)
     queue.close()
 
 
@@ -87,25 +116,26 @@ def test_who_said_what_survives_the_trip(tmp_path):
     queue.close()
 
 
-def test_a_night_with_the_database_down_loses_nothing(tmp_path):
+def test_a_pass_with_the_database_down_loses_nothing(tmp_path):
     store = _Store(down=True)
     queue = _queue(tmp_path, [("s1", "user", "важная реплика"), ("s1", "assistant", "ответ")])
 
     shipped, _ = nightly_job.ship_turns(store, queue)
 
     assert shipped == 0
-    assert queue.count() == 2  # ждут следующей ночи
+    assert len(queue.unshipped()) == 2  # ждут следующего прогона
     queue.close()
 
 
-def test_a_turn_already_in_the_memory_does_not_block_the_queue_forever(tmp_path):
+def test_a_turn_the_live_store_writes_nothing_for_does_not_block_the_queue_forever(tmp_path):
+    # Nothing left after scrubbing, store alive: the turn is let go instead of retried forever.
     store = _Store(duplicates={"это уже записано"})
     queue = _queue(tmp_path, [("s1", "user", "это уже записано"), ("s1", "assistant", "новое")])
 
     shipped, _ = nightly_job.ship_turns(store, queue)
 
     assert shipped == 1
-    assert queue.count() == 0  # дубликат отпущен, а не оставлен навечно
+    assert queue.unshipped() == []
     queue.close()
 
 
@@ -172,7 +202,7 @@ def test_facts_are_dug_out_of_an_answer_wrapped_in_prose_and_fences():
     raw = 'Вот что нашлось:\n```json\n[{"content": "Переезд в декабре", "type": "event", "priority": "P1"}]\n```\nВсё.'
 
     assert nightly_job.parse_facts(raw) == [
-        {"content": "Переезд в декабре", "type": "event", "priority": "P1"}
+        {"content": "Переезд в декабре", "type": "event", "priority": "P3"}
     ]
 
 
@@ -181,11 +211,18 @@ def test_an_answer_that_is_not_a_list_of_facts_yields_nothing_rather_than_garbag
     assert nightly_job.parse_facts(raw) == []
 
 
+def test_a_distilled_fact_starts_on_probation_whatever_priority_the_model_claims():
+    # P1 is the core, and only a deliberate write gets there.
+    raw = '[{"content": "Переезд в декабре", "type": "event", "priority": "P1"}]'
+
+    assert [fact["priority"] for fact in nightly_job.parse_facts(raw)] == ["P3"]
+
+
 def test_an_invented_kind_of_memory_is_recorded_as_a_plain_fact():
     raw = '[{"content": "Любит кофе", "type": "сплетня", "priority": "P9"}]'
 
     assert nightly_job.parse_facts(raw) == [
-        {"content": "Любит кофе", "type": "fact", "priority": "P2"}
+        {"content": "Любит кофе", "type": "fact", "priority": "P3"}
     ]
 
 
@@ -301,7 +338,7 @@ def test_an_exchange_that_was_distilled_is_not_distilled_again(tmp_path, monkeyp
 
     assert nightly_job.distill_exchanges(store, queue) == 1
     assert store.saved[0]["content"] == "Переезд в декабре"
-    assert store.saved[0]["priority"] == "P1"
+    assert store.saved[0]["priority"] == "P3"
     assert queue.count_exchanges() == 0
     queue.close()
 
@@ -318,6 +355,52 @@ def test_a_fact_found_at_night_is_left_for_the_batch_that_fills_in_meaning_searc
     nightly_job.distill_exchanges(store, queue)
 
     assert store.saved[0]["embed"] is False
+    queue.close()
+
+
+# -- разбор по темам ---------------------------------------------------------------------
+
+
+def _topic_queue(tmp_path):
+    queue = _queue(tmp_path, [])
+    queue.enqueue_topic("s1", "переезд", [
+        {"role": "user", "content": "решили переезжать в декабре, кота берём с собой"},
+        {"role": "assistant", "content": "понял, запомню"},
+    ])
+    return queue
+
+
+def test_one_topic_yields_at_most_two_facts(tmp_path, monkeypatch):
+    raw = "[" + ",".join(f'{{"content": "устойчивый факт {i}", "type": "fact"}}' for i in range(6)) + "]"
+    monkeypatch.setattr(nightly_job, "ask_model", lambda messages: raw)
+    store = _Store()
+    queue = _topic_queue(tmp_path)
+
+    assert nightly_job.distill_topics(store, queue) == 2
+    assert len(store.saved) == 2
+    assert all(row["priority"] == "P3" and row["chat_id"] == "hermes:nightly" for row in store.saved)
+    assert queue.count_topics() == 0
+    queue.close()
+
+
+def test_a_fact_memory_already_knows_is_not_written_again(tmp_path, monkeypatch):
+    monkeypatch.setattr(nightly_job, "ask_model",
+                        lambda messages: '[{"content": "Переезд в декабре", "type": "decision"}]')
+    store = _Store(known={"Переезд в декабре"})
+    queue = _topic_queue(tmp_path)
+
+    assert nightly_job.distill_topics(store, queue) == 0
+    assert store.saved == []
+    queue.close()
+
+
+def test_a_topic_the_model_did_not_answer_waits_for_the_next_pass(tmp_path, monkeypatch):
+    monkeypatch.setattr(nightly_job, "ask_model", lambda messages: None)
+    store = _Store()
+    queue = _topic_queue(tmp_path)
+
+    assert nightly_job.distill_topics(store, queue) == 0
+    assert queue.count_topics() == 1
     queue.close()
 
 

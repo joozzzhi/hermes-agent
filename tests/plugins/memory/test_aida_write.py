@@ -68,7 +68,14 @@ def test_the_insert_speaks_the_bot_s_dialect():
                            role="system", chat_id="hermes:abc")
 
     assert params == {"content": "Переезд", "memory_type": "decision", "priority": "P1",
-                      "role": "system", "chat_id": "hermes:abc"}
+                      "role": "system", "chat_id": "hermes:abc", "created_at": None}
+
+
+def test_a_late_turn_keeps_the_time_it_was_said():
+    params = insert_params("да", memory_type="dialogue", priority="P3", role="user",
+                           chat_id="hermes:abc", created_at="2026-10-09 12:00:00+00")
+
+    assert params["created_at"] == "2026-10-09 12:00:00+00"
 
 
 @pytest.mark.parametrize("bad", ["сплетня", "", None, "DIALOGUE", 5])

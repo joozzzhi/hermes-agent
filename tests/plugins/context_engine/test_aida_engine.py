@@ -1,33 +1,34 @@
 from __future__ import annotations
 
 import threading
+import time
+
+import pytest
 
 import plugins.context_engine.aida as engine_module
 from plugins.context_engine.aida import AidaContextEngine
 
 
 class _Store:
-    """Стоит вместо общей базы: отдаёт, что велено, и считает обращения."""
+    """Стоит вместо общей базы: отдаёт ядро, что велено, и считает обращения."""
 
-    def __init__(self, *, knowledge=None, found=None, explode: bool = False):
-        self.knowledge = knowledge or []
-        self.found = found or []
-        self.explode = explode
-        self.recall_calls = 0
-        self.knowledge_calls = 0
+    def __init__(self, *, core=None, down: bool = False):
+        self.core = core or []
+        self.down = down
+        self.core_calls = 0
         self.closed = False
 
-    def _execute_guarded(self, sql, params):
-        if self.explode:
-            raise RuntimeError("база недоступна")
-        self.knowledge_calls += 1
-        return [(row["content"], row["memory_type"]) for row in self.knowledge]
+    def core_rows(self):
+        self.core_calls += 1
+        if self.down:
+            return None
+        return [dict(row) for row in self.core]
 
-    def recall(self, query, limit=8):
-        if self.explode:
-            raise RuntimeError("база недоступна")
-        self.recall_calls += 1
-        return list(self.found)
+    def recall(self, *args, **kwargs):  # pragma: no cover - a call here is the failure
+        pytest.fail("the engine must not search memory — the memory provider does")
+
+    def recall_tiers(self, *args, **kwargs):  # pragma: no cover
+        pytest.fail("the engine must not search memory — the memory provider does")
 
     def close(self):
         self.closed = True
@@ -36,7 +37,13 @@ class _Store:
 def _engine(store) -> AidaContextEngine:
     eng = AidaContextEngine()
     eng._store = store
-    eng._store_tried = True
+    return eng
+
+
+def _engine_without_memory() -> AidaContextEngine:
+    eng = AidaContextEngine()
+    eng._store = None
+    eng._store_retry_at = time.monotonic() + 3600  # base not configured / not reachable
     return eng
 
 
@@ -49,96 +56,166 @@ def _request(question: str = "что там с переездом") -> list[dict
     ]
 
 
+def _core(*contents: str) -> list[dict]:
+    return [{"content": c, "memory_type": "fact", "created_at": None} for c in contents]
+
+
+def _system_text(selected: list[dict]) -> str:
+    return "\n".join(str(m.get("content")) for m in selected if m.get("role") == "system")
+
+
 # -- обычная работа ------------------------------------------------------------------------
 
 
-def test_the_question_arrives_with_what_memory_knows_about_it():
-    store = _Store(
-        knowledge=[{"content": "Оператор работает с ноутбука", "memory_type": "fact"}],
-        found=[{"content": "переезд в декабре", "memory_type": "event", "created_at": None}],
-    )
-
-    selected = _engine(store).select_context(_request(), incoming_message={"role": "user", "content": "переезд"})
-
-    assert any("Оператор работает с ноутбука" in str(m.get("content")) for m in selected)
-    assert "переезд в декабре" in str(selected[-1]["content"])
-    assert str(selected[-1]["content"]).endswith("что там с переездом")
-
-
-def test_an_old_line_of_conversation_comes_back_as_itself_not_as_a_summary():
-    store = _Store(found=[
-        {"content": "я переезжаю в декабре", "memory_type": "dialogue", "role": "user", "created_at": None},
-    ])
+def test_the_core_stands_in_the_system_part_and_the_conversation_follows_verbatim():
+    store = _Store(core=_core("Оператор работает с ноутбука"))
 
     selected = _engine(store).select_context(_request())
 
-    assert "Оператор: я переезжаю в декабре" in str(selected[-1]["content"])
+    assert "Оператор работает с ноутбука" in _system_text(selected)
+    assert selected[1:] == _request()[1:]
+
+
+def test_the_engine_does_not_search_memory_for_the_question():
+    # Найденное под вопрос приносит плагин памяти, и хозяин закрепляет его при реплике.
+    store = _Store(core=_core("ядро"))
+
+    selected = _engine(store).select_context(_request())
+
+    assert selected[-1] == {"role": "user", "content": "что там с переездом"}
+
+
+def test_what_memory_found_stays_with_its_question_byte_for_byte():
+    recalled = "<memory-context>\n- [fact] переезд в декабре\n</memory-context>\n\nчто там с переездом"
+    request = _request()[:-1] + [{"role": "user", "content": recalled}]
+
+    selected = _engine(_Store()).select_context(request)
+
+    assert selected[-1]["content"] == recalled
 
 
 def test_the_persisted_conversation_is_never_touched():
     request = _request()
     snapshot = [dict(m) for m in request]
 
-    _engine(_Store(found=[{"content": "деталь", "memory_type": "fact", "created_at": None}])).select_context(request)
+    _engine(_Store(core=_core("ядро"))).select_context(request)
 
     assert request == snapshot
+
+
+def test_the_personality_of_the_host_stays_on_the_wire():
+    # Ядро внутри системной части хозяина, а не вторым системным сообщением: сборщик запроса
+    # к Anthropic оставляет только последнее системное сообщение.
+    store = _Store(core=_core("Оператор работает с ноутбука"))
+
+    selected = _engine(store).select_context(_request())
+
+    systems = [m for m in selected if m.get("role") == "system"]
+    assert len(systems) == 1
+    assert systems[0]["content"].startswith("личность")
+    assert "Оператор работает с ноутбука" in systems[0]["content"]
+
+
+# -- запрос только дописывается ------------------------------------------------------------
+
+
+def _growing_conversation(turns: int) -> list[dict]:
+    request = [{"role": "system", "content": "личность"}]
+    for index in range(turns):
+        request += [{"role": "user", "content": f"вопрос {index}"},
+                    {"role": "assistant", "content": f"ответ {index}"}]
+    return request
+
+
+def test_consecutive_requests_only_ever_grow_at_their_end():
+    # Кеш поставщика жив, пока начало запроса совпадает байт в байт.
+    store = _Store(core=_core("ядро один", "ядро два"))
+    eng = _engine(store)
+
+    previous = eng.select_context(_growing_conversation(3))
+    for turns in range(4, 12):
+        store.core = _core("в базе тем временем появилась новая запись P1")
+        current = eng.select_context(_growing_conversation(turns))
+        assert current[:len(previous)] == previous
+        assert len(current) == len(previous) + 2
+        previous = current
+
+
+def test_the_core_is_read_once_and_not_on_every_request():
+    store = _Store(core=_core("ядро"))
+    eng = _engine(store)
+
+    for turns in range(2, 8):
+        eng.select_context(_growing_conversation(turns))
+
+    assert store.core_calls == 1
+
+
+def test_after_a_pause_longer_than_the_cache_the_core_is_read_again(monkeypatch):
+    store = _Store(core=_core("старое ядро"))
+    eng = _engine(store)
+    clock = [1000.0]
+    monkeypatch.setattr(engine_module, "time", type("_Clock", (), {"monotonic": staticmethod(lambda: clock[0])}))
+
+    first = eng.select_context(_growing_conversation(3))
+    store.core = _core("новое ядро")
+    clock[0] += engine_module.DEFAULT_CACHE_TTL + 1
+    second = eng.select_context(_growing_conversation(4))
+
+    assert "старое ядро" in _system_text(first)
+    assert "новое ядро" in _system_text(second)
+    assert store.core_calls == 2
+    # the tail fits, so the pause rebuilds the head without cutting the conversation
+    assert second[1:] == _growing_conversation(4)[1:]
+
+
+def test_a_core_that_could_not_be_read_is_asked_for_again_on_the_next_request():
+    store = _Store(core=_core("ядро"), down=True)
+    eng = _engine(store)
+
+    first = eng.select_context(_request())
+    store.down = False
+    second = eng.select_context(_request())
+
+    assert "ядро" not in _system_text(first)
+    assert "ядро" in _system_text(second)
 
 
 # -- когда что-то не так -------------------------------------------------------------------
 
 
-def test_without_shared_memory_the_engine_does_not_interfere():
-    eng = AidaContextEngine()
-    eng._store_tried = True  # память не настроена
+def test_without_shared_memory_the_engine_still_keeps_the_tail():
+    selected = _engine_without_memory().select_context(_request())
 
-    assert eng.select_context(_request()) is None
+    assert selected == _request()
 
 
-def test_a_database_that_fails_costs_the_extra_context_not_the_answer():
-    assert _engine(_Store(explode=True)).select_context(_request()) is None
+def test_a_database_that_fails_costs_the_core_not_the_answer():
+    selected = _engine(_Store(down=True)).select_context(_request())
+
+    assert selected == _request()
 
 
 def test_an_empty_request_is_left_alone():
     assert _engine(_Store()).select_context([]) is None
 
 
+def test_a_request_with_only_a_system_part_is_left_alone():
+    assert _engine(_Store()).select_context([{"role": "system", "content": "личность"}]) is None
+
+
 def test_a_request_with_no_question_in_it_still_assembles():
-    store = _Store(knowledge=[{"content": "знание", "memory_type": "fact"}])
+    store = _Store(core=_core("знание"))
     request = [{"role": "system", "content": "личность"}, {"role": "assistant", "content": "ответ"}]
 
     selected = _engine(store).select_context(request)
 
     assert selected is not None
-    assert store.recall_calls == 0  # искать нечего — в базу не ходим
+    assert selected[-1] == {"role": "assistant", "content": "ответ"}
 
 
-# -- цена сборки ---------------------------------------------------------------------------
-
-
-def test_tool_work_inside_one_turn_does_not_search_the_base_over_and_over():
-    store = _Store(found=[{"content": "деталь", "memory_type": "fact", "created_at": None}])
-    eng = _engine(store)
-
-    for _ in range(5):
-        eng.select_context(_request())
-
-    assert store.recall_calls == 1
-    assert store.knowledge_calls == 1
-
-
-def test_a_new_question_is_searched_for_anew():
-    store = _Store(found=[{"content": "деталь", "memory_type": "fact", "created_at": None}])
-    eng = _engine(store)
-
-    eng.select_context(_request("первый вопрос"))
-    eng.select_context(_request("совсем другой вопрос"))
-
-    assert store.recall_calls == 2
-
-
-def test_several_threads_assembling_at_once_do_not_trip_over_the_cache():
-    store = _Store(found=[{"content": "деталь", "memory_type": "fact", "created_at": None}])
-    eng = _engine(store)
+def test_several_threads_assembling_at_once_do_not_trip_over_each_other():
+    eng = _engine(_Store(core=_core("ядро")))
     results = []
 
     def _assemble(index: int) -> None:
@@ -157,19 +234,42 @@ def test_several_threads_assembling_at_once_do_not_trip_over_the_cache():
 # -- край окна -----------------------------------------------------------------------------
 
 
-def test_running_out_of_room_lets_old_messages_go_and_never_retells_them():
+def test_running_out_of_room_lets_old_messages_go_and_never_retells_them(monkeypatch):
+    def _no_model(*args, **kwargs):  # pragma: no cover
+        pytest.fail("compress() must never call a model")
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", _no_model, raising=False)
+    monkeypatch.setenv("AIDA_CONTEXT_TOKENS", "1000")
     eng = _engine(_Store())
-    eng.total_budget = 400
     messages = [{"role": "system", "content": "личность"}]
-    messages += [{"role": "user", "content": f"реплика {i} " + "я" * 100} for i in range(20)]
+    for i in range(60):
+        messages += [{"role": "user", "content": f"реплика {i} " + "я" * 100},
+                     {"role": "assistant", "content": f"ответ {i}"}]
 
     kept = eng.compress(messages)
 
     assert kept[0]["content"] == "личность"
     assert len(kept) < len(messages)
-    assert kept[-1]["content"].startswith("реплика 19")
-    assert not any("итог" in str(m.get("content")).lower() for m in kept)  # никакого пересказа
+    assert kept[1]["role"] == "user"
+    assert kept[-1] == messages[-1]
+    assert all(m in messages for m in kept)  # ничего не пересказано и не выдумано
     assert eng.compression_count == 1
+
+
+def test_compress_cuts_inside_a_long_turn_rather_than_giving_up(monkeypatch):
+    monkeypatch.setenv("AIDA_CONTEXT_TOKENS", "2000")
+    eng = _engine(_Store())
+    messages = [{"role": "system", "content": "личность"}, {"role": "user", "content": "почини сборку"}]
+    for index in range(200):
+        messages += [{"role": "assistant", "content": "", "tool_calls": [{"id": f"c{index}", "function": {"name": "bash"}}]},
+                     {"role": "tool", "tool_call_id": f"c{index}", "content": "в" * 300}]
+
+    kept = eng.compress(messages)
+
+    assert len(kept) < len(messages)
+    assert kept[1] == messages[1]
+    assert kept[2]["role"] == "assistant"
+    assert kept[-1] == messages[-1]
 
 
 def test_a_conversation_that_fits_is_left_exactly_as_it_was():
@@ -222,47 +322,36 @@ def test_the_engine_registers_itself_the_way_the_host_expects():
     assert isinstance(collected["engine"], AidaContextEngine)
 
 
-# -- ход с инструментами и несколько разговоров ---------------------------------------------
+# -- бюджет и несколько разговоров ----------------------------------------------------------
 
 
-def _tool_turn_request(question: str, steps: int) -> list[dict]:
-    request = [{"role": "system", "content": "личность"}, {"role": "user", "content": question}]
-    for step in range(steps):
-        request.append({"role": "assistant", "content": "",
-                        "tool_calls": [{"id": f"c{step}", "function": {"name": "bash"}}]})
-        request.append({"role": "tool", "tool_call_id": f"c{step}", "content": "готово"})
+def _long_conversation(tag: str, turns: int, size: int = 1500) -> list[dict]:
+    request = [{"role": "system", "content": "личность"}]
+    for index in range(turns):
+        request += [{"role": "user", "content": f"{tag} вопрос {index} " + "в" * size},
+                    {"role": "assistant", "content": f"{tag} ответ {index} " + "о" * size}]
     return request
 
 
-def test_what_memory_found_reaches_every_request_of_a_turn_that_uses_tools():
-    store = _Store(found=[{"content": "переезд в декабре", "memory_type": "event", "created_at": None}])
-    eng = _engine(store)
+def test_the_window_of_the_model_sets_the_budget():
+    eng = _engine(_Store())
+    conversation = _long_conversation("A", 80)  # ~240 000 знаков
 
-    requests = [eng.select_context(_tool_turn_request("что с переездом", steps)) for steps in (0, 1, 2)]
+    small = eng.select_context(conversation, budget_tokens=200_000)
+    large = _engine(_Store()).select_context(conversation, budget_tokens=10_000_000)
 
-    for selected in requests:
-        question = next(m for m in selected if m.get("role") == "user")
-        assert "переезд в декабре" in question["content"]
-    assert requests[0][1] == requests[1][1] == requests[2][1]
-    assert store.recall_calls == 1               # искали один раз на ход, не на каждый запрос
+    assert len(small) < len(conversation)
+    assert large == conversation
 
 
 def test_two_conversations_through_one_engine_keep_their_own_start_of_tail():
     eng = _engine(_Store())
-    eng.total_budget = 40_000
 
-    def conversation(tag: str, turns: int) -> list[dict]:
-        request = [{"role": "system", "content": "личность"}]
-        for index in range(turns):
-            request += [{"role": "user", "content": f"{tag} вопрос {index} " + "в" * 1500},
-                        {"role": "assistant", "content": f"{tag} ответ {index} " + "о" * 1500}]
-        return request
+    a = eng.select_context(_long_conversation("A", 80), budget_tokens=200_000)
+    b = eng.select_context(_long_conversation("B", 6), budget_tokens=200_000)
+    a_again = eng.select_context(_long_conversation("A", 80), budget_tokens=200_000)
 
-    a = eng.select_context(conversation("A", 40))
-    b = eng.select_context(conversation("B", 6))
-    a_again = eng.select_context(conversation("A", 40))
-
-    assert len(a) < 40 * 2                       # у длинного разговора хвост обрезан
+    assert len(a) < 1 + 80 * 2                   # у длинного разговора хвост обрезан
     assert len(b) == 1 + 6 * 2                   # у короткого — цел, и чужое начало ему не мешает
     assert a_again == a                          # начало хвоста у A запомнено и не поехало
 
@@ -279,19 +368,21 @@ def _aging_request(turns: int) -> list[dict]:
     return request
 
 
-def test_the_read_dedup_is_reset_only_when_more_results_have_been_released(monkeypatch):
+def test_the_read_dedup_is_reset_when_results_have_been_released(monkeypatch):
+    # Модель, которой понадобился отпущенный результат, перечитает файл — и должна получить
+    # содержимое, а не «файл не менялся».
+    monkeypatch.setenv("AIDA_CONTEXT_TOKENS", "10000")
     resets = []
     monkeypatch.setattr(AidaContextEngine, "_reset_read_dedup", staticmethod(lambda: resets.append(1)))
     eng = _engine(_Store())
 
-    eng.select_context(_aging_request(2))       # ничего не состарено
+    eng.select_context(_aging_request(2))       # всё помещается, ничего не отпущено
     assert resets == []
-    eng.select_context(_aging_request(4))       # два результата отпущены
+    selected = eng.select_context(_aging_request(12))   # не помещается: пересборка с заглушками
+    assert any("отпущен из запроса" in str(m.get("content")) for m in selected)
     assert len(resets) == 1
-    eng.select_context(_aging_request(4))       # тот же запрос ещё раз: новых замен нет
+    eng.select_context(_aging_request(12))      # тот же запрос ещё раз: новых замен нет
     assert len(resets) == 1
-    eng.select_context(_aging_request(5))       # ещё один
-    assert len(resets) == 2
 
 
 def test_a_failing_dedup_reset_never_breaks_the_request(monkeypatch):
@@ -301,30 +392,18 @@ def test_a_failing_dedup_reset_never_breaks_the_request(monkeypatch):
         raise RuntimeError("учёт недоступен")
 
     monkeypatch.setattr(tracking, "reset_file_dedup", boom)
+    monkeypatch.setenv("AIDA_CONTEXT_TOKENS", "10000")
 
-    selected = _engine(_Store()).select_context(_aging_request(4))
+    selected = _engine(_Store()).select_context(_aging_request(12))
 
-    assert selected and selected[-1]["role"] == "assistant" or selected
-
-
-def test_the_window_of_the_model_sets_the_budget():
-    eng = _engine(_Store())
-
-    eng.select_context(_request(), budget_tokens=200_000)
-
-    assert eng.total_budget == 90_000
+    assert selected is not None and selected[-1]["content"] == "ответ 11"
 
 
 # -- запрос без разговора ------------------------------------------------------------------
 
 
 def _long_tool_chain(pairs: int = 40, size: int = 4000) -> list[dict]:
-    """Разговор, каким он бывает в середине длинной работы: один вопрос и цепочка инструментов.
-
-    Так выглядела сессия, на которой Гермес 2026-09-22 четырежды получил отказ «в запросе нет
-    ни одного сообщения»: последняя реплика человека давно позади, всё после неё — пары
-    «обращение — результат», и бюджету хватает только на их конец.
-    """
+    """Разговор, каким он бывает в середине длинной работы: один вопрос и цепочка инструментов."""
     chain: list[dict] = [
         {"role": "system", "content": "личность"},
         {"role": "user", "content": "разбери, почему падает сборка"},
@@ -336,32 +415,30 @@ def _long_tool_chain(pairs: int = 40, size: int = 4000) -> list[dict]:
     return chain
 
 
-def test_a_long_tool_chain_never_leaves_the_request_without_a_conversation():
-    selected = _engine(_Store()).select_context(_long_tool_chain(), budget_tokens=200_000)
+def test_a_long_tool_chain_never_leaves_the_request_without_a_conversation(monkeypatch):
+    monkeypatch.setenv("AIDA_CONTEXT_TOKENS", "10000")
+
+    selected = _engine(_Store()).select_context(_long_tool_chain(200, 400))
 
     assert selected is not None
-    assert any(m.get("role") == "user" and not m.get("tool_call_id") for m in selected)
+    assert selected[1] == {"role": "user", "content": "разбери, почему падает сборка"}
+    called = {c["id"] for m in selected for c in (m.get("tool_calls") or ())}
+    assert all(m.get("tool_call_id") in called for m in selected if m.get("role") == "tool")
 
 
 def test_a_request_that_lost_its_conversation_is_handed_back_untouched(monkeypatch):
     # Если сборка всё же вернёт одну системную часть, отправлять это нельзя: поставщик
     # отвечает отказом, который не повторяют, и ход умирает целиком. Движок отходит в сторону.
-    import plugins.context_engine.aida as module
-
-    monkeypatch.setattr(module, "assemble_with_anchor",
-                        lambda *args, **kwargs: ([{"role": "system", "content": "только знание"}], None, 0))
+    monkeypatch.setattr(engine_module, "select_tail",
+                        lambda messages, budget, state=None, force=False: ([], state, False))
 
     assert _engine(_Store()).select_context(_request()) is None
 
 
-def test_the_personality_of_the_host_stays_on_the_wire():
-    # Знание внутри системной части хозяина, а не вторым системным сообщением: сборщик запроса
-    # к Anthropic оставляет только последнее системное сообщение.
-    store = _Store(knowledge=[{"content": "Оператор работает с ноутбука", "memory_type": "fact"}])
+def test_an_assembly_that_blows_up_hands_the_request_back_untouched(monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("сборка упала")
 
-    selected = _engine(store).select_context(_request())
+    monkeypatch.setattr(engine_module, "select_tail", boom)
 
-    systems = [m for m in selected if m.get("role") == "system"]
-    assert len(systems) == 1
-    assert systems[0]["content"].startswith("личность")
-    assert "Оператор работает с ноутбука" in systems[0]["content"]
+    assert _engine(_Store()).select_context(_request()) is None

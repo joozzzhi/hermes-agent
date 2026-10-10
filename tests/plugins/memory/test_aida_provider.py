@@ -12,11 +12,24 @@ from plugins.memory.aida import AidaMemoryProvider, _Store
 class _FakeStore:
     """Stands in for the shared database: records what was asked, returns what it was told to."""
 
-    def __init__(self, memories=None, delay: float = 0.0):
+    def __init__(self, memories=None, delay: float = 0.0, dialogue=None, down: bool = False):
         self.memories = memories or []
+        self.dialogue = dialogue or []
         self.delay = delay
+        self.down = down
         self.queries: list[tuple[str, int]] = []
+        self.tier_queries: list[str] = []
+        self.used: list[list[int]] = []
         self.closed = False
+
+    def recall_tiers(self, query: str):
+        self.tier_queries.append(query)
+        if self.down:
+            return None
+        return list(self.memories), list(self.dialogue)
+
+    def mark_used(self, ids) -> None:
+        self.used.append(list(ids))
 
     def recall(self, query: str, limit: int = 8) -> list[dict]:
         if self.delay:
@@ -38,11 +51,12 @@ class _RecordingStore(_FakeStore):
         self.fail = fail
 
     def save(self, content, *, memory_type="fact", priority="P2", role="assistant",
-             chat_id="", embed=True) -> list[int]:
+             chat_id="", embed=True, created_at=None, dedupe=True) -> list[int]:
         if self.fail:
             return []
         self.saved.append({"content": content, "memory_type": memory_type,
-                           "priority": priority, "role": role, "chat_id": chat_id})
+                           "priority": priority, "role": role, "chat_id": chat_id,
+                           "dedupe": dedupe})
         return [len(self.saved)]
 
     def archive(self, content: str) -> int:
@@ -60,48 +74,80 @@ def _provider(store: _FakeStore) -> AidaMemoryProvider:
     return provider
 
 
-def _run_prefetch(provider: AidaMemoryProvider, query: str) -> None:
-    provider.queue_prefetch(query)
-    provider._thread.join(timeout=5)
-
-
 # -- valid input -----------------------------------------------------------------------
 
 
 def test_recalled_memory_reaches_the_turn_and_the_indicator_counts_it():
     provider = _provider(_FakeStore([_memory(1), _memory(2, "кот Борис")]))
 
-    _run_prefetch(provider, "что там с переездом")
     block = provider.prefetch("что там с переездом")
 
     assert "Переезд в декабре" in block and "кот Борис" in block
     assert provider.recall_status().count == 2
 
 
-def test_nothing_recalled_still_shows_the_operator_that_memory_was_consulted():
-    # The operator asked to always see that memory was reached for — a silent empty recall
-    # is indistinguishable from an answer invented on the spot.
+def test_lines_of_past_dialogue_are_quoted_with_who_said_them():
+    dialogue = [{"id": 5, "content": "переезжаем в декабре", "role": "user", "created_at": None},
+                {"id": 6, "content": "записал", "role": "assistant", "created_at": None}]
+    provider = _provider(_FakeStore([], dialogue=dialogue))
+
+    block = provider.prefetch("что там с переездом")
+
+    assert "Оператор: переезжаем в декабре" in block
+    assert "Я: записал" in block
+    assert provider.recall_status().count == 2
+
+
+def test_nothing_recalled_leaves_no_indicator():
     provider = _provider(_FakeStore([]))
 
-    _run_prefetch(provider, "чего никогда не было")
-    provider.prefetch("чего никогда не было")
-
-    assert provider.recall_status().count == 0
+    assert provider.prefetch("чего никогда не было") == ""
+    assert provider.recall_status() is None
 
 
 def test_indicator_stays_silent_until_a_recall_has_actually_happened():
     assert _provider(_FakeStore([_memory()])).recall_status() is None
 
 
-def test_prefetched_memory_is_handed_over_once_and_never_re_injected():
-    provider = _provider(_FakeStore([_memory()]))
+def test_every_question_is_searched_for_itself_at_the_moment_it_is_asked():
+    # No answer prepared after the previous turn: that one answered the previous question.
+    store = _FakeStore([_memory()])
+    provider = _provider(store)
 
-    _run_prefetch(provider, "переезд")
-    first = provider.prefetch("переезд")
-    second = provider.prefetch("переезд")
+    provider.prefetch("что там с переездом")
+    provider.prefetch("а как зовут кота")
 
-    assert "Переезд" in first
-    assert second == ""
+    assert store.tier_queries == ["что там с переездом", "а как зовут кота"]
+
+
+@pytest.mark.parametrize("query", ["", "ок", "да, давай", "x" * (aida.MIN_QUESTION_LENGTH - 1)])
+def test_a_reply_too_short_to_ask_anything_is_not_searched_for(query):
+    store = _FakeStore([_memory()])
+    provider = _provider(store)
+
+    assert provider.prefetch(query) == ""
+    assert store.tier_queries == []
+    assert provider.recall_status() is None
+
+
+def test_an_unreachable_store_leaves_the_turn_without_memory_and_without_an_indicator():
+    provider = _provider(_FakeStore([_memory()], down=True))
+
+    assert provider.prefetch("что там с переездом") == ""
+    assert provider.recall_status() is None
+
+
+def test_facts_put_in_front_of_the_model_are_counted_as_used():
+    # This is what a distilled fact on probation is judged by.
+    store = _FakeStore([_memory(3), _memory(4, "кот Борис")])
+    provider = _provider(store)
+
+    provider.prefetch("что там с переездом")
+
+    deadline = time.monotonic() + 5
+    while not store.used and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert store.used == [[3, 4]]
 
 
 def test_the_tool_returns_what_was_found():
@@ -209,36 +255,6 @@ def test_a_store_that_recovers_is_used_again():
 
 
 # -- concurrent access -----------------------------------------------------------------
-
-
-def test_a_second_recall_does_not_pile_up_behind_a_slow_one():
-    store = _FakeStore([_memory()], delay=3.0)
-    provider = _provider(store)
-
-    provider.queue_prefetch("первый вопрос")
-    first_thread = provider._thread
-    provider.queue_prefetch("второй вопрос")
-
-    assert provider._thread is first_thread
-    first_thread.join(timeout=10)
-    assert len(store.queries) == 1
-
-
-def test_two_readers_of_the_cache_never_see_the_same_memory_twice():
-    provider = _provider(_FakeStore([_memory()]))
-    _run_prefetch(provider, "переезд")
-    seen: list[str] = []
-
-    def _consume() -> None:
-        seen.append(provider.prefetch("переезд"))
-
-    readers = [threading.Thread(target=_consume) for _ in range(6)]
-    for reader in readers:
-        reader.start()
-    for reader in readers:
-        reader.join(timeout=5)
-
-    assert len([block for block in seen if block]) == 1
 
 
 # -- lifecycle -------------------------------------------------------------------------
@@ -366,7 +382,25 @@ def test_removing_a_note_stops_it_surfacing_without_writing_anything_new():
 # -- writing: the conversation itself ------------------------------------------------------
 
 
-def test_a_finished_turn_waits_locally_instead_of_holding_up_the_reply(tmp_path):
+def test_a_finished_turn_goes_into_the_shared_store_at_once_word_for_word(tmp_path):
+    from plugins.memory.aida.queue_db import TurnQueue
+
+    store = _RecordingStore()
+    provider = _provider(store)
+    provider._queue = TurnQueue(tmp_path / "queue.db")
+
+    provider.sync_turn("что там с переездом", "в декабре", session_id="session-7")
+
+    assert [(row["role"], row["content"]) for row in store.saved] == [
+        ("user", "что там с переездом"), ("assistant", "в декабре")]
+    assert all(row["memory_type"] == "dialogue" and row["priority"] == "P3" for row in store.saved)
+    assert all(row["chat_id"] == "hermes:session-7" for row in store.saved)
+    # "да" said twice was said twice.
+    assert all(row["dedupe"] is False for row in store.saved)
+    provider._queue.close()
+
+
+def test_a_written_turn_still_waits_in_the_local_queue_to_be_distilled(tmp_path):
     from plugins.memory.aida.queue_db import TurnQueue
 
     provider = _provider(_RecordingStore())
@@ -377,18 +411,39 @@ def test_a_finished_turn_waits_locally_instead_of_holding_up_the_reply(tmp_path)
     rows = provider._queue.pending()
     assert [row["role"] for row in rows] == ["user", "assistant"]
     assert rows[0]["session_id"] == "session-7"
+    assert all(row["shipped"] for row in rows)
+    assert provider._queue.unshipped() == []
+    provider._queue.close()
 
 
-def test_a_turn_is_never_pushed_to_the_shared_store_mid_conversation(tmp_path):
+def test_with_the_store_down_the_turn_waits_unshipped_in_the_queue(tmp_path):
+    from plugins.memory.aida.queue_db import TurnQueue
+
+    provider = _provider(_RecordingStore(fail=True))
+    provider._queue = TurnQueue(tmp_path / "queue.db")
+
+    provider.sync_turn("что там с переездом", "в декабре", session_id="session-7")
+
+    assert [row["content"] for row in provider._queue.unshipped()] == ["что там с переездом", "в декабре"]
+    provider._queue.close()
+
+
+def test_a_turn_where_the_agent_saved_a_fact_itself_is_kept_but_not_distilled(tmp_path):
     from plugins.memory.aida.queue_db import TurnQueue
 
     store = _RecordingStore()
     provider = _provider(store)
     provider._queue = TurnQueue(tmp_path / "queue.db")
+    messages = [{"role": "user", "content": "запомни: переезд в декабре"},
+                {"role": "assistant", "tool_calls": [{"function": {"name": "aida_remember"}}]},
+                {"role": "tool", "tool_call_id": "1", "content": "ok"},
+                {"role": "assistant", "content": "запомнил"}]
 
-    provider.sync_turn("вопрос", "ответ", session_id="session-7")
+    provider.sync_turn("запомни: переезд в декабре", "запомнил", session_id="s", messages=messages)
 
-    assert store.saved == []  # the nightly job carries it, not the turn
+    assert len(store.saved) == 2
+    assert not any(row["distill"] for row in provider._queue.pending())
+    provider._queue.close()
 
 
 def test_a_helper_agent_working_in_the_background_does_not_write_to_the_shared_memory(tmp_path):
@@ -415,48 +470,16 @@ def test_a_missing_local_queue_costs_the_record_of_the_turn_but_not_the_turn():
     provider.sync_turn("вопрос", "ответ")  # must not raise
 
 
-def test_teardown_releases_the_database_and_waits_for_a_running_recall():
-    store = _FakeStore([_memory()], delay=0.2)
+def test_teardown_releases_the_database():
+    store = _FakeStore([_memory()])
     provider = _provider(store)
 
-    provider.queue_prefetch("переезд")
     provider.shutdown()
 
     assert store.closed is True
-    assert not provider._thread.is_alive()
 
 
-# -- когда контекст собирает движок --------------------------------------------------------
-
-
-def test_memory_stops_searching_when_the_context_engine_took_that_over(tmp_path):
-    # Две копии одного и того же найденного в запросе — это плата дважды: временем и
-    # чужой квотой. Ищет кто-то один.
-    from plugins.memory.aida import recall_signal
-
-    store = _FakeStore([_memory()])
-    provider = _provider(store)
-    try:
-        recall_signal.announce_engine()
-        provider.queue_prefetch("что там с переездом")
-
-        assert provider._thread is None
-        assert store.queries == []
-    finally:
-        recall_signal.reset()
-
-
-def test_the_indicator_still_shows_what_the_engine_raised():
-    from plugins.memory.aida import recall_signal
-
-    provider = _provider(_FakeStore())
-    try:
-        recall_signal.announce_engine()
-        recall_signal.publish(3)
-
-        assert provider.recall_status().count == 3
-    finally:
-        recall_signal.reset()
+# -- the turn's own remember call --------------------------------------------------------
 
 
 def test_an_old_remember_in_a_long_chat_does_not_silence_every_later_turn():

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
-from datetime import datetime
+import sqlite3
+from datetime import datetime, timedelta, timezone
 
 from plugins.memory.aida.search import (
     BLOCK_BUDGET,
+    CORE_SQL,
+    FILTERS,
+    format_recall,
+    pick_facts,
     ENTRY_BUDGET,
     MATCH_FLOOR,
     RRF_K,
@@ -103,12 +108,15 @@ def test_vector_literal_is_what_pgvector_parses():
 def test_row_to_memory_keeps_the_column_order_the_sql_selects():
     created = datetime(2026, 9, 21)
 
-    assert row_to_memory((11, "текст", "decision", "P1", created, 4.2)) == {
+    assert row_to_memory((11, "текст", "decision", "P1", created, "user", "hermes:s1", 4.2)) == {
         "id": 11,
         "content": "текст",
         "memory_type": "decision",
         "priority": "P1",
         "created_at": created,
+        "role": "user",
+        "chat_id": "hermes:s1",
+        "rank": 4.2,
     }
 
 
@@ -117,3 +125,98 @@ def test_match_floor_stays_in_step_with_the_bot():
     # Drifting apart here makes one side silent about a memory the other happily returns.
     assert MATCH_FLOOR == 0.8
     assert RRF_K == 60
+
+
+# -- the three tiers -----------------------------------------------------------------------
+
+
+def _memories_db(rows):
+    """An in-memory stand-in for the shared table, enough to run the tier filters against."""
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT, memory_type TEXT, "
+               "priority TEXT, chat_id TEXT, status TEXT, created_at TEXT)")
+    db.executemany(
+        "INSERT INTO memories (content, memory_type, priority, chat_id, status, created_at) "
+        "VALUES (?, ?, ?, ?, 'active', '2026-10-01')", rows)
+    return db
+
+
+_TIER_ROWS = [
+    ("написано руками", "rule", "P1", "hermes:s1"),
+    ("заметка бота", "fact", "P1", None),
+    ("извлечено разбором", "fact", "P1", "hermes:nightly"),
+    ("реплика", "dialogue", "P1", "hermes:s1"),
+    ("обычный факт", "fact", "P2", "hermes:s1"),
+]
+
+
+def test_the_core_is_what_was_written_on_purpose_and_not_what_the_distiller_marked_p1():
+    db = _memories_db(_TIER_ROWS)
+
+    core = [row[0] for row in db.execute(CORE_SQL)]
+
+    assert sorted(core) == ["заметка бота", "написано руками"]
+
+
+def test_a_distilled_p1_row_is_searched_for_as_an_ordinary_fact():
+    db = _memories_db(_TIER_ROWS)
+
+    facts = [row[0] for row in db.execute(f"SELECT content FROM memories m WHERE {FILTERS['facts']}")]
+
+    assert sorted(facts) == ["извлечено разбором", "обычный факт"]
+
+
+def _fact(id_, priority="P2", score=1.0, age_days=0.0, now=datetime(2026, 10, 10, tzinfo=timezone.utc)):
+    return {"id": id_, "content": f"факт {id_}", "memory_type": "fact", "priority": priority,
+            "score": score, "created_at": now - timedelta(days=age_days)}
+
+
+def test_one_question_raises_at_most_ten_p2_and_three_p3_facts():
+    now = datetime(2026, 10, 10, tzinfo=timezone.utc)
+    ranked = [_fact(i, "P2") for i in range(20)] + [_fact(100 + i, "P3") for i in range(10)]
+
+    picked = pick_facts(ranked, now=now)
+
+    assert sum(1 for f in picked if f["priority"] == "P2") == 10
+    assert sum(1 for f in picked if f["priority"] == "P3") == 3
+
+
+def test_a_fresh_fact_outranks_an_equally_relevant_old_one():
+    now = datetime(2026, 10, 10, tzinfo=timezone.utc)
+
+    picked = pick_facts([_fact(1, age_days=60, now=now), _fact(2, age_days=0, now=now)], now=now)
+
+    assert [f["id"] for f in picked] == [2, 1]
+
+
+def test_a_fact_on_probation_fades_faster_than_an_ordinary_one():
+    now = datetime(2026, 10, 10, tzinfo=timezone.utc)
+
+    picked = pick_facts([_fact(1, "P3", age_days=10, now=now), _fact(2, "P2", age_days=10, now=now)], now=now)
+
+    assert [f["id"] for f in picked] == [2, 1]
+
+
+def test_old_conversation_is_quoted_with_who_said_it_and_when():
+    dialogue = [{"content": "переезжаю в декабре", "role": "user", "created_at": datetime(2026, 8, 12)},
+                {"content": "записал", "role": "assistant", "created_at": None}]
+
+    block, shown = format_recall([], dialogue)
+
+    assert "[2026-08-12] Оператор: переезжаю в декабре" in block
+    assert "Я: записал" in block
+    assert shown == 2
+
+
+def test_facts_go_in_whole_and_quotes_are_cut_to_their_opening():
+    fact = {"content": "ф" * 1500, "memory_type": "fact", "created_at": None}
+    quote = {"content": "ц" * 1500, "role": "user", "created_at": None}
+
+    block, _ = format_recall([fact], [quote])
+
+    assert "ф" * 1500 in block
+    assert "ц" * 1500 not in block and "[…]" in block
+
+
+def test_nothing_found_is_an_empty_block():
+    assert format_recall([], []) == ("", 0)
