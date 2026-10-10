@@ -597,7 +597,13 @@ def consolidate(hermes_home: Path) -> list[str]:
 
 
 def run(hermes_home: Path) -> int:
-    for line in consolidate(hermes_home):
+    from .idle import consolidate_locked
+
+    report = consolidate_locked(hermes_home)
+    if report is None:
+        print("Разбор уже идёт (замок aida_consolidate.lock занят) — этот запуск пропущен.")
+        return 1
+    for line in report:
         print(line)
     return 0
 

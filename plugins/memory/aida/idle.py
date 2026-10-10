@@ -94,21 +94,33 @@ def _fire(key: str) -> None:
 
 def run_now(home: Path) -> bool:
     """Разобрать очередь. False — разбор уже идёт в другом процессе или не удался."""
-    lock = home / LOCK_NAME
-    if not _acquire(lock):
-        logger.info("Память: разбор уже идёт в другом процессе, этот пропущен")
-        return False
     started = time.monotonic()
     try:
-        from .nightly_job import consolidate
-
-        report = consolidate(home)
+        report = consolidate_locked(home)
+        if report is None:
+            logger.info("Память: разбор уже идёт в другом процессе, этот пропущен")
+            return False
         logger.info("Память: разбор по паузе за %.0f с — %s", time.monotonic() - started,
                     "; ".join(line.strip() for line in report))
         return True
     except Exception:
         logger.warning("Память: разбор по паузе не удался, очередь цела и подождёт", exc_info=True)
         return False
+
+
+def consolidate_locked(home: Path) -> list[str] | None:
+    """Один прогон разбора под замком профиля. None — разбор уже идёт в другом месте.
+
+    Через замок идут все пути: таймер тишины и ручной запуск скриптом. Иначе ручной прогон
+    поверх идущего разбирал бы ту же очередь второй раз и писал те же факты дважды.
+    """
+    lock = Path(home) / LOCK_NAME
+    if not _acquire(lock):
+        return None
+    try:
+        from .nightly_job import consolidate
+
+        return consolidate(Path(home))
     finally:
         try:
             lock.unlink()
