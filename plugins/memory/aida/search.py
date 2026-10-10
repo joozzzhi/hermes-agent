@@ -291,6 +291,25 @@ def format_block(memories: list[dict], entry_budget: int = ENTRY_BUDGET, block_b
     return "[Из моей памяти — прошлые разговоры с оператором]\n" + "\n".join(lines)
 
 
+def _fact_line(item: dict) -> str:
+    tag = " · ".join(part for part in (item.get("memory_type"), _date(item)) if part)
+    return f"- [{tag}] {_flat(item.get('content'))}"
+
+
+def facts_that_fit(facts: list[dict], block_budget: int = RECALL_BLOCK_BUDGET) -> list[dict]:
+    """The facts that actually make it into the block, in order. Only these were put in front
+    of the model — and only these may count as used, or a fact nobody saw passes probation."""
+    kept: list[dict] = []
+    spent = 0
+    for item in facts:
+        size = len(_fact_line(item))
+        if spent + size > block_budget and kept:
+            break
+        kept.append(item)
+        spent += size
+    return kept
+
+
 def format_recall(facts: list[dict], dialogue: list[dict], block_budget: int = RECALL_BLOCK_BUDGET) -> tuple[str, int]:
     """What one question raised, as it goes into the turn. Returns the text and the row count.
 
@@ -299,17 +318,10 @@ def format_recall(facts: list[dict], dialogue: list[dict], block_budget: int = R
     operator's words handed back as the agent's own are worse than no recall at all.
     """
     sections: list[str] = []
-    spent = 0
     shown = 0
 
-    lines: list[str] = []
-    for item in facts:
-        tag = " · ".join(part for part in (item.get("memory_type"), _date(item)) if part)
-        line = f"- [{tag}] {_flat(item.get('content'))}"
-        if spent + len(line) > block_budget and lines:
-            break
-        lines.append(line)
-        spent += len(line)
+    lines = [_fact_line(item) for item in facts_that_fit(facts, block_budget)]
+    spent = sum(len(line) for line in lines)
     if lines:
         sections.append("# По теме вопроса — что я об этом знаю\n" + "\n".join(lines))
         shown += len(lines)

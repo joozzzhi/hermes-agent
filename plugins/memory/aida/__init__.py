@@ -41,6 +41,7 @@ from .search import (
     above_vector_floor,
     combine_rrf,
     format_block,
+    facts_that_fit,
     format_recall,
     fts_sql,
     pick_facts,
@@ -185,6 +186,9 @@ class _Store:
         self._conn: Any = None
         self._lock = threading.Lock()
         self._blocked_until = 0.0
+        # The last question recall embedded, kept so the same words written into the store
+        # moments later are not embedded a second time (see _embed_rows).
+        self._question: tuple[str, list[float]] | None = None
 
     # -- connection ------------------------------------------------------------------
 
@@ -302,6 +306,7 @@ class _Store:
         if time.monotonic() < self._blocked_until:
             return None
         vector = self._embed(query, timeout=QUERY_EMBEDDING_TIMEOUT)
+        self._remember_question(query, vector)
         with self._lock:
             try:
                 facts = self._search("facts", query, vector, 20)
@@ -383,6 +388,7 @@ class _Store:
         if time.monotonic() < self._blocked_until:
             return []
         written: list[int] = []
+        pairs: list[tuple[int, str]] = []
         with self._lock:
             try:
                 for chunk in chunks:
@@ -397,26 +403,49 @@ class _Store:
                     )
                     if rows:
                         written.append(int(rows[0][0]))
+                        pairs.append((int(rows[0][0]), chunk))
             except Exception as exc:
                 # The back-off is what lets a caller tell "the store refused" from "there was
                 # nothing to write" (see alive()); without it a failed turn looked delivered.
                 self._blocked_until = time.monotonic() + BACKOFF_SECONDS
                 logger.warning("Aida memory: could not write, the thought stays unsaved: %s", exc)
                 return []
-        if embed and written:
-            spawn_context_thread(self._embed_rows, args=(written,), name="aida-embed").start()
+        if embed and pairs:
+            spawn_context_thread(self._embed_rows, args=(pairs,), name="aida-embed").start()
         return written
 
-    def _embed_rows(self, ids: list[int]) -> None:
-        """Fill in the vector after the row exists. A missing vector costs ranking, not the memory."""
-        for row_id in ids:
-            content_rows = self._execute_guarded("SELECT content FROM memories WHERE id = %(id)s", {"id": row_id})
-            if not content_rows:
-                continue
-            vector = self._embed(str(content_rows[0][0]))
-            if vector is None:
-                return  # no embeddings available at all — stop rather than retry per row
+    def _embed_rows(self, pairs: list[tuple[int, str]]) -> None:
+        """Fill in the vectors after the rows exist. A missing vector costs ranking, not the memory.
+
+        The operator's line was already embedded once this turn — as the question recall searched
+        for — so that vector is reused instead of asking the service again; whatever is left goes
+        out in a single request.
+        """
+        vectors: dict[int, list[float]] = {}
+        rest: list[tuple[int, str]] = []
+        for row_id, text in pairs:
+            known = self._question_vector(text)
+            if known is not None:
+                vectors[row_id] = known
+            else:
+                rest.append((row_id, text))
+        if rest:
+            batch = self.embed_many([text for _, text in rest]) or []
+            for (row_id, _), vector in zip(rest, batch):
+                if vector:
+                    vectors[row_id] = vector
+        for row_id, vector in vectors.items():
             self._execute_guarded(EMBED_SQL, {"vec": to_vector_literal(vector), "id": row_id})
+
+    def _remember_question(self, text: str, vector: list[float] | None) -> None:
+        if vector is not None:
+            self._question = (scrub(text).strip(), vector)
+
+    def _question_vector(self, text: str) -> list[float] | None:
+        remembered = getattr(self, "_question", None)
+        if remembered and remembered[0] == scrub(text).strip():
+            return remembered[1]
+        return None
 
     def _execute_guarded(self, sql: str, params: dict) -> list[tuple]:
         with self._lock:
@@ -583,8 +612,9 @@ class AidaMemoryProvider(MemoryProvider):
         block, shown = format_recall(*tiers)
         self._last_count = shown
         if block:
-            # Off the reply's path: the count only matters to the next tidy-up.
-            used = [item["id"] for item in tiers[0]]
+            # Off the reply's path: the count only matters to the next tidy-up. Only facts
+            # that made it into the block count — one cut for room was never seen.
+            used = [item["id"] for item in facts_that_fit(tiers[0])]
             spawn_context_thread(self._store.mark_used, args=(used,), name="aida-used").start()
         return block
 

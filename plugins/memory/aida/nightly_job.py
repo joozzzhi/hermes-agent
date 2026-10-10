@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import re
@@ -130,17 +131,58 @@ type — одно из: decision, rule, preference, fact, project, contact
 SYSTEM_PROMPT = FACTS_SYSTEM_PROMPT
 
 
-def load_profile_env(hermes_home: Path) -> None:
-    """Ключи лежат в `.env` профиля. Скрипт может быть запущен и в обход агента."""
-    env_file = hermes_home / ".env"
+# Ключи прогона. Шлюз ведёт несколько профилей в одном процессе, и общее окружение процесса
+# принадлежит тому, кто его запустил: ключ, взятый оттуда, может оказаться чужим. Поэтому
+# прогон читает ключи из `.env` своего профиля и держит их здесь, не трогая os.environ.
+_RUN_SECRETS: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar("aida_run_secrets", default=None)
+
+SECRET_NAMES = ("SUPABASE_DB_URL", "OPENROUTER_API_KEY", "GEMINI_API_KEY")
+
+
+def read_profile_env(hermes_home: Path) -> dict[str, str]:
+    """Пары ключ=значение из `.env` профиля, как есть. Окружение процесса не меняется."""
+    env_file = Path(hermes_home) / ".env"
+    values: dict[str, str] = {}
     if not env_file.exists():
-        return
+        return values
     for raw in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
         line = raw.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+def profile_secrets(hermes_home: Path) -> dict[str, str]:
+    """Ключи прогона для этого профиля: `.env` профиля, а чего там нет — общее окружение,
+    но только если процесс не ведёт несколько профилей сразу (тогда оно может быть чужим)."""
+    from_file = read_profile_env(hermes_home)
+    shared_ok = not _multiplex_active()
+    secrets: dict[str, str] = {}
+    for name in SECRET_NAMES:
+        value = from_file.get(name) or (os.environ.get(name, "") if shared_ok else "")
+        if value:
+            secrets[name] = value
+    return secrets
+
+
+def _multiplex_active() -> bool:
+    try:
+        from agent.secret_scope import is_multiplex_active
+
+        return bool(is_multiplex_active())
+    except Exception:
+        return False
+
+
+def _secret(name: str) -> str:
+    secrets = _RUN_SECRETS.get()
+    if secrets is not None:
+        return secrets.get(name, "")
+    return "" if _multiplex_active() else os.environ.get(name, "")
 
 
 # ─── 1. Довезти дословное ─────────────────────────────────────────────────────
@@ -442,11 +484,11 @@ def _ask_over_http(messages: list[dict]) -> str | None:
 def _model_targets() -> list[dict]:
     """Цепочка попыток. У Gemini своя квота, поэтому он первый, если ключ есть."""
     targets = []
-    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    gemini_key = _secret("GEMINI_API_KEY")
     if gemini_key:
         model = os.environ.get("AIDA_DISTILL_GEMINI_MODEL", GEMINI_MODEL)
         targets.append({"label": "gemini", "url": GEMINI_BASE_URL, "key": gemini_key, "model": model})
-    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+    openrouter_key = _secret("OPENROUTER_API_KEY")
     fallbacks = tuple(
         model.strip() for model in os.environ.get("AIDA_DISTILL_MODELS", "").split(",") if model.strip()
     ) or OPENROUTER_MODELS
@@ -535,9 +577,18 @@ def consolidate(hermes_home: Path) -> list[str]:
     Зовётся, когда оператор замолчал (см. idle.py), и вручную — скриптом. Реплики к этому
     моменту уже в базе: их кладёт туда сам ход. Здесь остаётся то, что требует модели и
     времени, и чему самое место в паузе: кеш поставщика к этому часу всё равно остыл.
+
+    Ключи берутся из `.env` этого профиля (см. profile_secrets), а не из общего окружения.
     """
-    load_profile_env(hermes_home)
-    db_url = os.environ.get("SUPABASE_DB_URL", "")
+    token = _RUN_SECRETS.set(profile_secrets(Path(hermes_home)))
+    try:
+        return _consolidate(Path(hermes_home))
+    finally:
+        _RUN_SECRETS.reset(token)
+
+
+def _consolidate(hermes_home: Path) -> list[str]:
+    db_url = _secret("SUPABASE_DB_URL")
     if not db_url:
         return ["Общая память не настроена: нет строки подключения. Разбор пропущен."]
 
@@ -545,7 +596,7 @@ def consolidate(hermes_home: Path) -> list[str]:
     # должен оставаться читаемым и запускаемым даже там, где драйвера нет.
     from plugins.memory.aida import _Store
 
-    store = _Store(db_url, os.environ.get("OPENROUTER_API_KEY", ""))
+    store = _Store(db_url, _secret("OPENROUTER_API_KEY"))
     queue = TurnQueue(hermes_home / "aida_queue.db")
     report: list[str] = []
     try:

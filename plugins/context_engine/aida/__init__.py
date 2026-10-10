@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 # Бюджет запроса — доля окна модели, а не число: у окна в миллион токенов и у окна в двести
 # тысяч «много» значит разное. Нижняя граница нужна маленьким окнам, чтобы хвост не схлопнулся.
 CONTEXT_SHARE = 0.05
-MIN_CONTEXT_TOKENS = 30_000
+MIN_CONTEXT_TOKENS = 60_000
 UNKNOWN_WINDOW_TOKENS = 50_000
 # Ядро занимает не больше этой доли бюджета; что не влезло, находится поиском.
 KNOWLEDGE_SHARE = 0.2
@@ -71,7 +71,11 @@ CHARS_PER_TOKEN_RANGE = (2.0, 4.5)
 CALIBRATE_FROM_CHARS = 60_000
 
 # Сколько живёт кеш поставщика. Тишина длиннее — кеш остыл, и запрос можно пересобрать даром.
-DEFAULT_CACHE_TTL = 3600.0
+# Берётся из того же места, откуда его берёт хозяин (`prompt_caching.cache_ttl`): движок,
+# считающий кеш часовым при пятиминутном кеше, пропускает дешёвую пересборку и платит за
+# полную запись кеша после каждой паузы длиннее пяти минут.
+CACHE_TTL_SECONDS = {"5m": 300.0, "1h": 3600.0}
+DEFAULT_CACHE_TTL = CACHE_TTL_SECONDS["5m"]
 
 MAX_TRACKED_CONVERSATIONS = 64
 
@@ -81,6 +85,20 @@ def _env_float(name: str, default: float) -> float:
         return float(os.environ.get(name, "") or default)
     except ValueError:
         return default
+
+
+def cache_ttl_seconds() -> float:
+    """Жизнь кеша поставщика: явная настройка AIDA_CACHE_TTL_SECONDS, иначе — то, что настроено
+    у хозяина в `prompt_caching.cache_ttl` (по умолчанию у него пять минут)."""
+    explicit = _env_float("AIDA_CACHE_TTL_SECONDS", 0.0)
+    if explicit > 0:
+        return explicit
+    try:
+        from agent.agent_runtime_helpers import configured_cache_ttl
+
+        return CACHE_TTL_SECONDS.get(configured_cache_ttl() or "5m", DEFAULT_CACHE_TTL)
+    except Exception:
+        return DEFAULT_CACHE_TTL
 
 
 @dataclass
@@ -220,7 +238,7 @@ class AidaContextEngine(ContextEngine):
         now = time.monotonic()
         # Оператор молчал дольше жизни кеша: начало запроса всё равно будет прочитано заново,
         # так что это единственный момент, когда его можно менять даром.
-        cold = bool(state.last_seen) and now - state.last_seen > _env_float("AIDA_CACHE_TTL_SECONDS", DEFAULT_CACHE_TTL)
+        cold = bool(state.last_seen) and now - state.last_seen > cache_ttl_seconds()
         state.last_seen = now
         budget = self._budget_chars(budget_tokens)
 
