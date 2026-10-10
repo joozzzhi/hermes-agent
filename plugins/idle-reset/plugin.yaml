@@ -1,0 +1,7 @@
+name: idle-reset
+version: "1.0"
+description: >
+  Starts a fresh gateway session when the current one has been silent longer than
+  IDLE_RESET_MINUTES (default 60). Hook: pre_gateway_dispatch.
+hooks:
+  - pre_gateway_dispatch
