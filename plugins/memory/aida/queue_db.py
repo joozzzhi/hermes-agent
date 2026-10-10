@@ -17,6 +17,8 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
+from .write import scrub
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS pending_turns (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,34 +65,82 @@ class TurnQueue:
         # check_same_thread=False with one lock around every use: turns are enqueued from the
         # agent's thread and drained from the nightly job's, and two connections to one file
         # would only trade this lock for SQLite's "database is locked".
-        self._conn = sqlite3.connect(str(self._path), check_same_thread=False)
+        # timeout: the gateway and a CLI session may hold the same file; wait for the other
+        # writer instead of failing the turn with "database is locked".
+        self._conn = sqlite3.connect(str(self._path), check_same_thread=False, timeout=15)
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
 
-    def enqueue(self, session_id: str, role: str, content: str) -> bool:
+    def _migrate(self) -> None:
+        """Columns added after the first release; a queue file from before keeps working.
+
+        ``shipped`` — the turn is already in the shared store and waits here only to be
+        distilled. ``distill`` — 0 for a turn the agent already saved a fact from on purpose.
+        Rows from the old nightly-only scheme get shipped=0, which is exactly what they are.
+        """
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(pending_turns)")}
+        if "shipped" not in columns:
+            self._conn.execute("ALTER TABLE pending_turns ADD COLUMN shipped INTEGER NOT NULL DEFAULT 0")
+        if "distill" not in columns:
+            self._conn.execute("ALTER TABLE pending_turns ADD COLUMN distill INTEGER NOT NULL DEFAULT 1")
+
+    def enqueue(self, session_id: str, role: str, content: str, *, shipped: bool = False,
+                distill: bool = True) -> bool:
         """Remember one side of a turn. Empty content is not a turn and is ignored."""
-        content = (content or "").strip()
+        content = scrub(content).strip()
         if not content:
             return False
         with self._lock:
             self._conn.execute(
-                "INSERT INTO pending_turns (session_id, role, content) VALUES (?, ?, ?)",
-                (session_id or "session", role, content),
+                "INSERT INTO pending_turns (session_id, role, content, shipped, distill) VALUES (?, ?, ?, ?, ?)",
+                (session_id or "session", role, content, int(bool(shipped)), int(bool(distill))),
             )
             self._conn.commit()
         return True
 
-    def pending(self, limit: int = 500) -> list[dict[str, Any]]:
-        """Oldest first — the shipment keeps the order the conversation happened in."""
+    def _turns(self, where: str, limit: int) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, session_id, role, content, created_at FROM pending_turns ORDER BY id LIMIT ?",
+                "SELECT id, session_id, role, content, created_at, shipped, distill FROM pending_turns "
+                f"WHERE {where} ORDER BY id LIMIT ?",
                 (limit,),
             ).fetchall()
         return [
-            {"id": row[0], "session_id": row[1], "role": row[2], "content": row[3], "created_at": row[4]}
+            {"id": row[0], "session_id": row[1], "role": row[2], "content": row[3],
+             "created_at": row[4], "shipped": bool(row[5]), "distill": bool(row[6])}
             for row in rows
         ]
+
+    def pending(self, limit: int = 500) -> list[dict[str, Any]]:
+        """Everything waiting, oldest first — the order the conversation happened in."""
+        return self._turns("1 = 1", limit)
+
+    def unshipped(self, limit: int = 500) -> list[dict[str, Any]]:
+        """Turns the shared store has not confirmed yet."""
+        return self._turns("shipped = 0", limit)
+
+    def shipped(self, limit: int = 500) -> list[dict[str, Any]]:
+        """Turns already in the store, waiting only to be distilled."""
+        return self._turns("shipped = 1", limit)
+
+    def mark_shipped(self, ids: Iterable[int]) -> int:
+        ids = [int(i) for i in ids]
+        if not ids:
+            return 0
+        with self._lock:
+            placeholders = ",".join("?" for _ in ids)
+            cursor = self._conn.execute(f"UPDATE pending_turns SET shipped = 1 WHERE id IN ({placeholders})", ids)
+            self._conn.commit()
+            return cursor.rowcount
+
+    def newest_age_seconds(self) -> float | None:
+        """How long ago the last turn was queued; None when nothing waits."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT (julianday('now') - julianday(max(created_at))) * 86400.0 FROM pending_turns"
+            ).fetchone()
+        return float(row[0]) if row and row[0] is not None else None
 
     def release(self, ids: Iterable[int]) -> int:
         """Drop turns the store has confirmed. Called after the insert, never before."""
@@ -110,7 +160,7 @@ class TurnQueue:
     # -- обмены, ждущие разбора ---------------------------------------------------------
 
     def enqueue_exchange(self, session_id: str, question: str, answer: str) -> bool:
-        question, answer = (question or "").strip(), (answer or "").strip()
+        question, answer = scrub(question).strip(), scrub(answer).strip()
         if not question or not answer:
             return False
         with self._lock:
@@ -153,9 +203,10 @@ class TurnQueue:
         Empty turns mean the segmenter drew a block with nothing in it — that's a malformed
         answer, not a topic, and is not worth a row.
         """
-        topic = (topic or "").strip()
+        topic = scrub(topic).strip()
         if not topic or not turns:
             return False
+        turns = [{**turn, "content": scrub(str(turn.get("content", "")))} for turn in turns]
         with self._lock:
             self._conn.execute(
                 "INSERT INTO pending_topics (session_id, topic, turns_json) VALUES (?, ?, ?)",

@@ -1,7 +1,8 @@
-"""Ночная работа общей памяти: довезти разговор, вытащить суть, дозаполнить поиск.
+"""Разбор общей памяти: довезти опоздавшее, вытащить суть, дозаполнить поиск.
 
-Днём разговор копится на ноуте: ответ не должен ждать базу на другом конце интернета.
-Ночью этот скрипт делает три вещи, в этом порядке:
+Имя файла осталось от времён, когда это делалось раз в сутки. Теперь разбор запускается,
+когда оператор замолчал на час (idle.py), а реплики попадают в базу сразу после хода; сюда
+доезжает только то, что не записалось из-за недоступной базы. Три вещи, в этом порядке:
 
 1. **Довозит дословное.** Каждая реплика из локальной очереди ложится в общую базу как есть.
    Строка уходит из очереди только после того, как база подтвердила запись, поэтому упавший
@@ -28,11 +29,11 @@ from typing import Iterable
 
 try:  # обычный путь: модуль плагина
     from .queue_db import TurnQueue
-    from .write import normalise_type, source_tag
+    from .write import normalise_type, scrub, source_tag
 except ImportError:  # запуск файлом, как его зовёт расписание
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     from plugins.memory.aida.queue_db import TurnQueue
-    from plugins.memory.aida.write import normalise_type, source_tag
+    from plugins.memory.aida.write import normalise_type, scrub, source_tag
 
 # Сколько работы за один прогон. Ограничения стоят не ради скорости, а ради чужой квоты:
 # ключ к моделям общий с ботом, и его ответы человеку не должны её терять.
@@ -45,7 +46,11 @@ EMBED_BATCH = 8
 # Короче этого — «ок», «ага», «поправляй». Порог взят у бота: он измерен на его переписке.
 MIN_EXCHANGE_LENGTH = 12
 MAX_FACTS_PER_EXCHANGE = 5
-MAX_FACTS_PER_TOPIC = 8
+# Разговор и так лежит в базе дословно и находится поиском, поэтому факт — исключение, а не
+# итог каждой темы. При восьми на тему разбор за 18 дней записал 260 «фактов» из сотни обменов.
+MAX_FACTS_PER_TOPIC = 2
+# Сколько дней факт из разбора живёт на испытательном сроке: не пригодился ни разу — уходит в архив.
+PROBATION_DAYS = 14.0
 
 # Сессия длиннее этого на разметку не идёт целиком — один вызов размётки должен читать
 # кусок, который влезает в голову модели за раз, а не весь день разговора.
@@ -79,8 +84,8 @@ OPENROUTER_MODELS = tuple(
     model.strip() for model in os.environ.get("AIDA_DISTILL_MODELS", "").split(",") if model.strip()
 )
 
-# Дословно тот же промпт, что у бота. Два разных определения «что стоит помнить» в одной
-# базе — это две разные памяти, между которыми человеку придётся выбирать.
+# Промпт извлечения строже, чем у бота: оператор решил, что память не должна превращаться в
+# склад, а сам разговор теперь хранится дословно и ничего не теряется, если факт не извлечён.
 SEGMENT_SYSTEM_PROMPT = """Ты размечаешь кусок разговора на смысловые темы — блоки подряд идущих реплик,
 которые держатся вокруг одного предмета (одной задачи, решения, события).
 
@@ -93,24 +98,31 @@ from_index и to_index — это индексы реплик из списка 
 Разговор ни о чём (приветствие, «ок», смена темы без сути) — тоже блок, просто мелкий.
 Если реплик мало и они об одном — верни один блок на все."""
 
-FACTS_SYSTEM_PROMPT = """Ты — экстрактор фактов из диалога. Твоя задача — вытащить только то, что стоит помнить надолго.
+FACTS_SYSTEM_PROMPT = """Ты решаешь, есть ли в куске диалога то, что нужно помнить через месяц. Обычно — нет.
 
-Верни ТОЛЬКО JSON-массив, без markdown, без пояснений, без обёрток.
+Сам диалог уже сохранён дословно и находится поиском. Твоя задача — не пересказать его, а заметить
+редкое: то, что изменит, как ассистент будет действовать в будущих разговорах.
+
+Верни ТОЛЬКО JSON-массив, без markdown, без пояснений, без обёрток. Не больше двух элементов.
 Формат каждого элемента:
-{"content": "факт одним предложением от третьего лица", "type": "...", "priority": "P1"|"P2"}
+{"content": "факт одним предложением от третьего лица", "type": "..."}
 
-type — одно из: fact, decision, preference, event, context, rule, project, contact
+type — одно из: decision, rule, preference, fact, project, contact
 
-priority:
-- P1 — устойчивое и важное: личные данные пользователя, принятые решения, правила и принципы работы, ключевые факты о проекте, стабильные предпочтения.
-- P2 — полезное, но временное: детали текущей задачи, разовые события, контекст этой недели.
+Извлекай ТОЛЬКО если это:
+- decision — оператор принял решение, которое действует дальше («переезжаем на X», «Y больше не используем»)
+- rule / preference — оператор сказал, как надо или не надо делать впредь
+- fact / project / contact — устойчивое сведение об операторе, его проекте или людях, которое не изменится через неделю
 
 НЕ извлекай:
-- вопросы, размышления вслух, гипотезы
-- то, что сказал ассистент о себе
+- ход текущей задачи, что сделано, что сломалось, что починили
+- события дня и планы на ближайшие дни
+- вопросы, размышления вслух, гипотезы, варианты, которые обсуждали, но не выбрали
+- то, что сказал или предложил ассистент, если оператор этого прямо не подтвердил
 - пересказ содержания диалога («обсуждали X»)
-- то, что верно только в этой реплике
+- то, что уже очевидно из самого предыдущего опыта работы
 
+Сомневаешься — не извлекай. Пустой ответ — нормальный и самый частый.
 Пиши content самодостаточно: он будет прочитан без диалога вокруг.
 Если извлекать нечего — верни []."""
 
@@ -134,29 +146,37 @@ def load_profile_env(hermes_home: Path) -> None:
 # ─── 1. Довезти дословное ─────────────────────────────────────────────────────
 
 
+def said_at(turn: dict) -> str | None:
+    """Время реплики из очереди (SQLite хранит его в UTC без пояса) — для колонки created_at."""
+    stamp = str(turn.get("created_at") or "").strip()
+    return f"{stamp}+00" if stamp else None
+
+
 def ship_turns(store, queue, limit: int = MAX_TURNS_PER_RUN) -> tuple[int, list[dict]]:
-    """Перенести реплики из очереди в общую базу. Возвращает счёт и то, что доехало."""
-    pending = queue.pending(limit=limit)
+    """Довезти реплики, которые не попали в базу сразу после хода (база была недоступна).
+
+    Реплика остаётся в очереди и после доставки — она ещё ждёт разбора; здесь она только
+    помечается доставленной. Дата в базе — время, когда это было сказано, а не довезено.
+    """
     shipped: list[dict] = []
-    for turn in pending:
+    for turn in queue.unshipped(limit=limit):
         ids = store.save(
             turn["content"],
             memory_type="dialogue",
-            priority="P2",
+            priority="P3",
             role=turn["role"],
             chat_id=source_tag(turn["session_id"]),
-            embed=False,  # вектора ставит третий проход, пачкой
+            created_at=said_at(turn),
+            dedupe=False,  # «да» и «продолжай» повторяются, и каждое было сказано
+            embed=False,  # вектора ставит последний проход, пачкой
         )
-        if not ids:
-            # База отказала или это уже есть. Первое — повод остановиться и подождать
-            # следующей ночи; второе оставило бы строку в очереди навсегда, поэтому
-            # отличаем: пустой ответ при живой базе значит дубликат, его отпускаем.
-            if not store.alive():
-                break
-            queue.release([turn["id"]])
-            continue
-        queue.release([turn["id"]])
-        shipped.append(turn)
+        if not ids and not store.alive():
+            break  # база отказала — остальное подождёт следующего раза
+        # Пустой ответ при живой базе значит, что после вычистки секретов от реплики ничего
+        # не осталось: держать её в очереди незачем.
+        queue.mark_shipped([turn["id"]])
+        if ids:
+            shipped.append(turn)
     return len(shipped), shipped
 
 
@@ -262,9 +282,14 @@ def segment_session(session_id: str, turns: list[dict]) -> list[tuple[str, list[
     return blocks
 
 
-def segment(queue, sessions: dict[str, list[dict]], limit: int = MAX_TOPICS_PER_RUN) -> int:
-    """Разметить привезённые сессии на темы и сложить блоки в очередь на извлечение."""
+def segment(queue, sessions: dict[str, list[dict]], limit: int = MAX_TOPICS_PER_RUN) -> tuple[int, list[int]]:
+    """Разметить сессии на темы и сложить блоки в очередь на извлечение.
+
+    Возвращает число блоков и номера реплик, которые в блоки попали: только их можно убирать
+    из очереди. Сессия, до которой в этот прогон не дошла очередь, ждёт следующего целиком.
+    """
     enqueued = 0
+    handled: list[int] = []
     for session_id, turns in sessions.items():
         if enqueued >= limit:
             break
@@ -272,7 +297,8 @@ def segment(queue, sessions: dict[str, list[dict]], limit: int = MAX_TOPICS_PER_
             payload = [{"role": t["role"], "content": t["content"]} for t in block_turns]
             if queue.enqueue_topic(session_id, topic, payload):
                 enqueued += 1
-    return enqueued
+        handled.extend(int(t["id"]) for t in turns)
+    return enqueued, handled
 
 
 def _format_topic_for_extraction(topic: str, turns: list[dict]) -> str:
@@ -305,6 +331,8 @@ def distill_topics(store, queue, limit: int = MAX_TOPICS_PER_RUN) -> int:
             unanswered += 1
             continue
         for fact in parse_facts(content, limit=MAX_FACTS_PER_TOPIC):
+            if store.knows(fact["content"]):
+                continue  # это уже в памяти, пусть и другими словами
             if store.save(fact["content"], memory_type=fact["type"], priority=fact["priority"],
                           role="system", chat_id=source_tag("nightly"), embed=False):
                 written += 1
@@ -339,7 +367,11 @@ def parse_facts(raw: str, limit: int = MAX_FACTS_PER_EXCHANGE) -> list[dict]:
         facts.append({
             "content": content,
             "type": normalise_type(item.get("type")),
-            "priority": "P1" if item.get("priority") == "P1" else "P2",
+            # Что бы модель ни поставила — P3, испытательный срок: факт из разбора должен
+            # сначала хоть раз пригодиться. P1 это ядро, и попадает туда только осознанная
+            # запись: разбор, который сам назначал P1 трём фактам из четырёх, за две недели
+            # вытеснил из ядра всё написанное руками.
+            "priority": "P3",
         })
         if len(facts) >= limit:
             break
@@ -352,6 +384,8 @@ def ask_model(messages: list[dict]) -> str | None:
     Возвращает текст ответа или None, если не ответил никто. Молчание здесь обязано быть
     отличимо от «ничего важного не нашлось» — иначе потерянный факт выглядит как работа.
     """
+    # Turns queued before redaction existed may still hold a credential in clear.
+    messages = [{**m, "content": scrub(str(m.get("content", "")))} for m in messages]
     content = _ask_through_agent(messages)
     if content:
         return content
@@ -483,12 +517,29 @@ def backfill_embeddings(store, limit: int = MAX_EMBEDDINGS_PER_RUN) -> tuple[int
 # ─── Прогон ───────────────────────────────────────────────────────────────────
 
 
-def run(hermes_home: Path) -> int:
+def distilling_enabled() -> bool:
+    """AIDA_DISTILL=off — жить только на осознанных записях и поиске по разговору."""
+    return os.environ.get("AIDA_DISTILL", "on").strip().lower() not in ("off", "0", "false", "no")
+
+
+def probation_days() -> float:
+    try:
+        return max(1.0, float(os.environ.get("AIDA_PROBATION_DAYS", "") or PROBATION_DAYS))
+    except ValueError:
+        return PROBATION_DAYS
+
+
+def consolidate(hermes_home: Path) -> list[str]:
+    """Один прогон разбора. Возвращает отчёт построчно — его печатает скрипт и пишет в журнал триггер.
+
+    Зовётся, когда оператор замолчал (см. idle.py), и вручную — скриптом. Реплики к этому
+    моменту уже в базе: их кладёт туда сам ход. Здесь остаётся то, что требует модели и
+    времени, и чему самое место в паузе: кеш поставщика к этому часу всё равно остыл.
+    """
     load_profile_env(hermes_home)
     db_url = os.environ.get("SUPABASE_DB_URL", "")
     if not db_url:
-        print("Общая память не настроена: нет строки подключения. Ночная работа пропущена.")
-        return 0
+        return ["Общая память не настроена: нет строки подключения. Разбор пропущен."]
 
     # Импорт здесь, а не наверху: модуль пакета тянет за собой драйвер базы, а этот файл
     # должен оставаться читаемым и запускаемым даже там, где драйвера нет.
@@ -496,37 +547,58 @@ def run(hermes_home: Path) -> int:
 
     store = _Store(db_url, os.environ.get("OPENROUTER_API_KEY", ""))
     queue = TurnQueue(hermes_home / "aida_queue.db")
+    report: list[str] = []
     try:
-        waiting = queue.count()
-        shipped, turns = ship_turns(store, queue)
-        sessions = build_sessions(turns)
+        late = len(queue.unshipped(limit=MAX_TURNS_PER_RUN))
+        shipped, _ = ship_turns(store, queue)
 
-        # Проход А: разметить привезённый разговор на темы и сложить блоки в очередь.
-        topics_enqueued = segment(queue, sessions)
+        ready = queue.shipped(limit=MAX_TURNS_PER_RUN)
+        distilling = distilling_enabled()
+        topics_enqueued, facts, old_exchanges_left = 0, 0, 0
+        if distilling:
+            # Проход А: разметить доставленный разговор на темы и сложить блоки в очередь.
+            sessions = build_sessions(turn for turn in ready if turn["distill"])
+            topics_enqueued, handled = segment(queue, sessions)
+            # Ход, из которого агент сам записал факт, разбирать незачем — он уходит без разметки.
+            queue.release(handled + [int(turn["id"]) for turn in ready if not turn["distill"]])
 
-        # Проход Б: разобрать размеченные темой блоки на факты.
-        facts = distill_topics(store, queue)
+            # Проход Б: разобрать размеченные темой блоки на факты.
+            facts = distill_topics(store, queue)
 
-        # Хвост старой очереди — обмены, поставленные до перехода на двухпроходную схему.
-        # Как только она опустеет, distill_exchanges будет всегда возвращать 0 бесплатно.
-        old_exchanges_left = queue.count_exchanges()
-        if old_exchanges_left:
-            facts += distill_exchanges(store, queue)
+            # Хвост старой очереди — обмены, поставленные до перехода на двухпроходную схему.
+            old_exchanges_left = queue.count_exchanges()
+            if old_exchanges_left:
+                facts += distill_exchanges(store, queue)
+        else:
+            # Разбор выключен: разговор уже в базе, очередь просто освобождается.
+            queue.release(int(turn["id"]) for turn in ready)
 
+        kept, archived = store.settle_probation(probation_days())
         filled, left = backfill_embeddings(store)
 
-        print("Ночная работа общей памяти")
-        print(f"  разговор: довезено {shipped} реплик из {waiting}, ждут ещё {queue.count()}")
-        print(f"  темы: размечено {topics_enqueued} блоков, ждут разбора {queue.count_topics()}")
+        report.append("Разбор общей памяти")
+        if late:
+            report.append(f"  разговор: довезено {shipped} реплик из {late} опоздавших")
+        if not distilling:
+            report.append("  разбор на факты выключен (AIDA_DISTILL=off)")
+        else:
+            report.append(f"  темы: размечено {topics_enqueued} блоков, ждут разбора {queue.count_topics()}")
         if old_exchanges_left:
-            print(f"  старая очередь: доразобрано {old_exchanges_left}, осталось {queue.count_exchanges()}")
-        print(f"  суть: записано фактов — {facts}")
-        print(f"  поиск по смыслу: дозаполнено {filled}, осталось без него {left}")
+            report.append(f"  старая очередь: доразобрано {old_exchanges_left}, осталось {queue.count_exchanges()}")
+        report.append(f"  суть: записано фактов — {facts}")
+        report.append(f"  испытательный срок: пригодились и оставлены — {kept}, не пригодились и убраны в архив — {archived}")
+        report.append(f"  поиск по смыслу: дозаполнено {filled}, осталось без него {left}")
         if not store.alive():
-            print("  база в эту ночь была недоступна — всё, что не доехало, ждёт в очереди")
+            report.append("  база была недоступна — всё, что не доехало, ждёт в очереди")
     finally:
         queue.close()
         store.close()
+    return report
+
+
+def run(hermes_home: Path) -> int:
+    for line in consolidate(hermes_home):
+        print(line)
     return 0
 
 

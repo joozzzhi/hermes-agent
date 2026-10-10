@@ -1,101 +1,101 @@
-"""Контекстный движок «витрина»: окна нет, контекст собирается заново на каждый запрос.
+"""Контекстный движок «витрина»: разговор не пересказывается никогда.
 
 Встроенный движок копит разговор в окне, а когда оно заполняется — пересказывает старую
 часть и продолжает с пересказа. Дальше модель опирается на пересказ и достраивает утраченные
 детали; это прямой источник выдуманных подробностей, и именно поэтому так делать запрещено.
 
-Здесь вместо этого повторено устройство движка, который работал на сервере: контекст — не
-хранилище, а витрина, и она собирается заново под каждый вопрос:
+Здесь вместо этого повторено устройство движка, который работал на сервере, — три уровня:
 
-* устойчивый слой (личность хозяина и знание, которое верно всегда) стоит первым и меняется
-  редко, чтобы поставщик мог попадать в свой кеш;
-* изменчивый слой (найденное по смыслу вопроса и всплывшие куски давнего разговора) едет
-  вместе с самим вопросом;
-* свежий хвост разговора остаётся дословно, настоящими сообщениями.
+* **Ядро** (P1 — личность оператора и то, что верно всегда) стоит в системной части. Его
+  собирает этот движок.
+* **Найденное под вопрос** (факты и куски давнего разговора) приходит вместе с вопросом. Его
+  ищет плагин памяти `aida`, а хозяин навсегда прикрепляет к реплике, под которую оно найдено.
+* **Свежий хвост разговора** остаётся дословно, настоящими сообщениями. Его ведёт этот движок.
 
-Ничего не пересказывается: всё, что не поместилось, лежит в общей памяти целиком и находится
-поиском. Движок читает ту же базу, что и память Гермеса, поэтому включать его имеет смысл
-вместе с плагином памяти `aida`.
+Движок на сервере собирал запрос с нуля на каждое сообщение: там каждый ответ был отдельным
+запуском. Гермес ведёт один длинный разговор, и повторять это здесь буквально значит на каждом
+ходу выбрасывать кеш поставщика. Поэтому правило другое: запрос только ДОПИСЫВАЕТСЯ в конец, а
+всё, что меняет его середину (ядро, начало хвоста, заглушки на месте старых результатов
+инструментов), решается разом и редко — когда хвост перестал помещаться или когда оператор
+молчал дольше, чем живёт кеш, и терять уже нечего.
 
-Включается строкой `context.engine: aida` в настройке; ошибка внутри безопасна — хозяин
-поймает её и отправит запрос так, как отправил бы без движка.
+Ничего не пересказывается: всё, что ушло из хвоста, лежит в общей памяти дословно и находится
+поиском. Включается строкой `context.engine: aida`; без плагина памяти и даже без базы движок
+работает — ведёт хвост, просто без ядра.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import dataclass, field
 from typing import Any
 
 from agent.context_engine import ContextEngine
 
 from .assembly import (
-    KNOWLEDGE_BUDGET,
-    OLD_HISTORY_BUDGET,
-    RECALLED_BUDGET,
-    TOTAL_BUDGET,
-    assemble_with_anchor,
+    TailState,
+    apply_state,
     build_knowledge_block,
-    build_old_history_block,
-    build_recalled_block,
+    count_aged,
     is_conversation_message,
+    merge_into_system,
     message_key,
     message_size,
-    safe_tail,
+    rebase,
+    select_tail,
     split_system,
-    total_budget_for,
 )
 
 logger = logging.getLogger(__name__)
 
-# Сколько живёт собранное. Внутри одного хода модель ходит к инструментам много раз, и
-# каждый такой поход — новый запрос: без этого мы бы искали в базе по десять раз на ход.
-DYNAMIC_TTL = 120.0
-KNOWLEDGE_TTL = 600.0
+# Бюджет запроса — доля окна модели, а не число: у окна в миллион токенов и у окна в двести
+# тысяч «много» значит разное. Нижняя граница нужна маленьким окнам, чтобы хвост не схлопнулся.
+CONTEXT_SHARE = 0.05
+MIN_CONTEXT_TOKENS = 30_000
+UNKNOWN_WINDOW_TOKENS = 50_000
+# Ядро занимает не больше этой доли бюджета; что не влезло, находится поиском.
+KNOWLEDGE_SHARE = 0.2
+# Хвосту остаётся не меньше этой доли, какой бы большой ни была системная часть хозяина.
+MIN_TAIL_SHARE = 0.4
 
-RECALL_LIMIT = 8
-OLD_HISTORY_LIMIT = 5
+# Бюджет считается в знаках, потому что знаки можно посчитать, не трогая модель. Сколько знаков
+# в токене, заранее неизвестно (у русского текста около двух с половиной, у кода и JSON больше),
+# поэтому число уточняется по каждому ответу: поставщик сообщает, во сколько токенов обошёлся
+# запрос, а сколько в нём было знаков, движок знает сам.
+DEFAULT_CHARS_PER_TOKEN = 3.0
+CHARS_PER_TOKEN_RANGE = (2.0, 4.5)
+CALIBRATE_FROM_CHARS = 60_000
+
+# Сколько живёт кеш поставщика. Тишина длиннее — кеш остыл, и запрос можно пересобрать даром.
+DEFAULT_CACHE_TTL = 3600.0
+
 MAX_TRACKED_CONVERSATIONS = 64
 
-P1_SQL = """
-SELECT content, memory_type FROM memories
-WHERE status = 'active' AND priority = 'P1' AND memory_type <> 'dialogue'
-ORDER BY created_at DESC
-LIMIT 60
-"""
 
-
-class _NoSignal:
-    """Заглушка: память не установлена, значит и показывать отметку некому."""
-
-    @staticmethod
-    def announce_engine() -> None:
-        pass
-
-    @staticmethod
-    def publish(count: int) -> None:
-        pass
-
-
-def _load_recall_signal():
-    """Ниточка к памяти: она ставит отметку «вспомнил», а ищет теперь движок.
-
-    Объявляемся не здесь, а при первой настоящей сборке: движок создаётся и просто затем,
-    чтобы перечислить доступные, и такое перечисление не должно отключать поиск у памяти.
-    """
+def _env_float(name: str, default: float) -> float:
     try:
-        from plugins.memory.aida import recall_signal
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
 
-        return recall_signal
-    except Exception:
-        logger.debug("Витрина: плагин памяти не найден, отметку о подъёме ставить некому")
-        return _NoSignal()
+
+@dataclass
+class _Conversation:
+    """Что решено про один разговор. Шлюз ведёт их несколько, у каждого своё."""
+
+    tail: TailState | None = None
+    knowledge: str | None = None  # None — ядро ещё не удалось прочитать
+    last_seen: float = 0.0
+    aged: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class AidaContextEngine(ContextEngine):
-    """Собирает контекст заново на каждый запрос и никогда не пересказывает разговор."""
+    """Ведёт хвост разговора и ядро в системной части; никогда не пересказывает."""
 
     # Пересказа нет, поэтому и сообщать не о чем: «отпустил старое» — это норма работы,
     # а не событие. Предупреждения и ошибки хозяин показывает сам.
@@ -106,19 +106,14 @@ class AidaContextEngine(ContextEngine):
         return "aida"
 
     def __init__(self) -> None:
-        self.total_budget = TOTAL_BUDGET
         self._lock = threading.Lock()
-        self._knowledge: tuple[float, str] = (0.0, "")
-        self._dynamic: tuple[float, str, str] = (0.0, "", "")  # время, ключ, блок
+        self._conversations: OrderedDict[int, _Conversation] = OrderedDict()
         self._store: Any = None
-        self._store_tried = False
-        self._recall_signal = _load_recall_signal()
+        self._store_retry_at = 0.0
         self._announced = False
-        # Начало хвоста по разговору: ключ — отпечаток первой реплики разговора, значение —
-        # отпечаток реплики, с которой хвост начинается. Один шлюз ведёт несколько разговоров.
-        self._anchors: OrderedDict[int, int] = OrderedDict()
-        # Сколько результатов инструментов уже состарено в запросе — по тому же ключу разговора.
-        self._aged_counts: OrderedDict[int, int] = OrderedDict()
+        self._announced_no_url = False
+        self._chars_per_token = DEFAULT_CHARS_PER_TOKEN
+        self._last_sent_chars = 0
 
     # -- хозяйство -----------------------------------------------------------------
 
@@ -126,9 +121,17 @@ class AidaContextEngine(ContextEngine):
         self.last_prompt_tokens = int(usage.get("prompt_tokens") or 0)
         self.last_completion_tokens = int(usage.get("completion_tokens") or 0)
         self.last_total_tokens = int(usage.get("total_tokens") or 0)
+        # Уточняем, сколько знаков в токене, по настоящему счёту поставщика. В токены запроса
+        # входят ещё описания инструментов, которых движок не видит, поэтому число выходит
+        # чуть заниженным — то есть бюджет чуть строже, а не мягче.
+        sent = self._last_sent_chars
+        if sent >= CALIBRATE_FROM_CHARS and self.last_prompt_tokens > 0:
+            low, high = CHARS_PER_TOKEN_RANGE
+            measured = min(high, max(low, sent / self.last_prompt_tokens))
+            self._chars_per_token = 0.7 * self._chars_per_token + 0.3 * measured
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
-        """Почти никогда: запрос уже собран под бюджет. Остаётся как страховка."""
+        """Почти никогда: запрос уже собран под бюджет. Остаётся как страховка хозяина."""
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         return bool(self.threshold_tokens and tokens and tokens > self.threshold_tokens)
 
@@ -136,49 +139,69 @@ class AidaContextEngine(ContextEngine):
                  focus_topic: str = None, force: bool = False, memory_context: str = "") -> list[dict]:
         """Отпустить старое, а не пересказать его.
 
-        Модель не зовём вообще: всё, что уходит из запроса, лежит в общей памяти целиком и
-        находится поиском. Пересказ на его месте был бы единственным, на что модель дальше
-        могла бы опереться — и ровно поэтому его здесь нет.
+        Модель не зовём вообще: всё, что уходит из истории, лежит в общей памяти дословно и
+        находится поиском. Результаты инструментов здесь не трогаем — это история хозяина, а
+        не запрос; режем только по тем же границам, что и хвост, включая разрез внутри
+        длинного хода (иначе ход из одной реплики и сотен обращений не сжимался бы вовсе).
         """
         system_head, conversation = split_system(messages)
+        if not conversation:
+            return list(messages)
         head_size = sum(message_size(m) for m in system_head)
-        kept = safe_tail(conversation, max(self.total_budget - head_size, 1))
+        budget = max(self._budget_chars(self.context_length) - head_size, 1)
+        kept = apply_state(conversation, rebase(conversation, budget, age=False))
         if len(kept) < len(conversation):
             self.compression_count += 1
             logger.info("Витрина: отпущено %d старых сообщений, они остаются в памяти",
                         len(conversation) - len(kept))
         return system_head + kept
 
+    def on_session_reset(self) -> None:
+        super().on_session_reset()
+        with self._lock:
+            self._conversations.clear()
+
+    def on_session_end(self, session_id: str, messages: list[dict]) -> None:
+        with self._lock:
+            store, self._store = self._store, None
+            self._store_retry_at = 0.0
+        if store is not None:
+            store.close()
+
+    # -- бюджет --------------------------------------------------------------------
+
+    def _budget_chars(self, window_tokens: int) -> int:
+        """Бюджет запроса в знаках: доля окна модели, пересчитанная по настоящему курсу токена."""
+        absolute = _env_float("AIDA_CONTEXT_TOKENS", 0.0)
+        if absolute > 0:
+            tokens = absolute
+        elif window_tokens and window_tokens > 0:
+            tokens = max(MIN_CONTEXT_TOKENS, window_tokens * _env_float("AIDA_CONTEXT_SHARE", CONTEXT_SHARE))
+        else:
+            tokens = UNKNOWN_WINDOW_TOKENS
+        return int(tokens * self._chars_per_token)
+
     # -- витрина -------------------------------------------------------------------
 
     def select_context(self, request_messages: list[dict], *, conversation_messages: list[dict] = None,
                        incoming_message: dict = None, budget_tokens: int = 0) -> list[dict] | None:
-        """Собрать контекст этого запроса заново. None — оставить всё как есть."""
+        """Собрать запрос: системная часть с ядром и хвост разговора. None — оставить как есть."""
         if not request_messages:
             return None
-        store = self._get_store()
-        if store is None:
-            return None  # общая память не настроена — ведём себя как обычный движок
-        self._recall_signal.announce_engine()
-        if not self._announced:
-            # Один раз за запуск, чтобы «движок работает» было видно в журнале, а не
-            # выводилось из того, что ничего не сломалось.
-            self._announced = True
-            logger.info("Витрина: контекст этого разговора собирается заново, окна нет")
         try:
             system_head, conversation = split_system(request_messages)
-            question = self._question_text(request_messages, incoming_message)
-            knowledge = self._knowledge_block(store)
-            recalled, old_history = self._dynamic_blocks(store, question)
-            conversation_key = message_key(conversation[0]) if conversation else None
-            with self._lock:
-                anchor = self._anchors.get(conversation_key)
-            if budget_tokens:
-                self.total_budget = total_budget_for(budget_tokens)
-            assembled, new_anchor, aged_count = assemble_with_anchor(
-                system_head, knowledge, recalled, old_history, conversation,
-                total_budget=self.total_budget, anchor=anchor)
-            if conversation and not any(is_conversation_message(m) for m in assembled):
+            if not conversation:
+                return None
+            if not self._announced:
+                # Один раз за запуск, чтобы «движок работает» было видно в журнале, а не
+                # выводилось из того, что ничего не сломалось.
+                self._announced = True
+                logger.info("Витрина: движок ведёт контекст этого разговора (бюджет — %.0f%% окна)",
+                            100 * _env_float("AIDA_CONTEXT_SHARE", CONTEXT_SHARE))
+            state = self._conversation(message_key(conversation[0]))
+            with state.lock:
+                assembled = self._assemble(state, system_head, conversation, budget_tokens)
+            if not any(is_conversation_message(m) for m in assembled):
                 # До модели доехал бы запрос без единого сообщения, а на такой поставщик
                 # отвечает отказом, который не повторяют: ход умер бы целиком. Разговор у нас
                 # есть — значит, ошиблась сборка, и правильный ответ здесь один: отойти в
@@ -186,26 +209,51 @@ class AidaContextEngine(ContextEngine):
                 logger.warning("Витрина: в собранном запросе не осталось разговора — "
                                "запрос уходит как есть (сообщений было %d)", len(conversation))
                 return None
-            if conversation_key is not None:
-                with self._lock:
-                    grew = aged_count > self._aged_counts.get(conversation_key, 0)
-                    if new_anchor is not None:
-                        self._anchors[conversation_key] = new_anchor
-                    self._aged_counts[conversation_key] = aged_count
-                    for tracked in (self._anchors, self._aged_counts):
-                        if conversation_key in tracked:
-                            tracked.move_to_end(conversation_key)
-                        while len(tracked) > MAX_TRACKED_CONVERSATIONS:
-                            tracked.popitem(last=False)
-                if grew:
-                    # Модель, которой понадобился отпущенный результат, перечитает файл. Без
-                    # сброса хозяин ответил бы «файл не менялся» — в расчёте на содержимое,
-                    # которое мы только что убрали из запроса.
-                    self._reset_read_dedup()
+            self._last_sent_chars = sum(message_size(m) for m in assembled)
             return assembled
         except Exception:
             logger.warning("Витрина: собрать не удалось, запрос уходит как есть", exc_info=True)
             return None
+
+    def _assemble(self, state: _Conversation, system_head: list[dict], conversation: list[dict],
+                  budget_tokens: int) -> list[dict]:
+        now = time.monotonic()
+        # Оператор молчал дольше жизни кеша: начало запроса всё равно будет прочитано заново,
+        # так что это единственный момент, когда его можно менять даром.
+        cold = bool(state.last_seen) and now - state.last_seen > _env_float("AIDA_CACHE_TTL_SECONDS", DEFAULT_CACHE_TTL)
+        state.last_seen = now
+        budget = self._budget_chars(budget_tokens)
+
+        if state.knowledge is None or cold:
+            fresh = self._load_knowledge(int(budget * KNOWLEDGE_SHARE))
+            if fresh is not None:
+                state.knowledge = fresh
+        knowledge = state.knowledge or ""
+
+        head_size = sum(message_size(m) for m in system_head) + len(knowledge)
+        tail_budget = max(int(budget * MIN_TAIL_SHARE), budget - head_size)
+        tail, state.tail, rebased = select_tail(conversation, tail_budget, state.tail, force=cold)
+        if rebased:
+            aged = count_aged(conversation, state.tail.aged)
+            if aged > state.aged:
+                # Модель, которой понадобился отпущенный результат, перечитает файл. Без
+                # сброса хозяин ответил бы «файл не менялся» — в расчёте на содержимое,
+                # которое мы только что убрали из запроса.
+                self._reset_read_dedup()
+            state.aged = aged
+            logger.info("Витрина: хвост пересобран (%s) — %d сообщений из %d, заглушек %d",
+                        "после паузы" if cold else "перестал помещаться", len(tail), len(conversation), aged)
+        return merge_into_system(system_head, knowledge) + tail
+
+    def _conversation(self, key: int) -> _Conversation:
+        with self._lock:
+            state = self._conversations.get(key)
+            if state is None:
+                state = self._conversations[key] = _Conversation()
+            self._conversations.move_to_end(key)
+            while len(self._conversations) > MAX_TRACKED_CONVERSATIONS:
+                self._conversations.popitem(last=False)
+            return state
 
     @staticmethod
     def _reset_read_dedup() -> None:
@@ -223,88 +271,41 @@ class AidaContextEngine(ContextEngine):
         except Exception:
             logger.debug("Витрина: сбросить учёт просмотра навыков не удалось", exc_info=True)
 
-    @staticmethod
-    def _question_text(request_messages: list[dict], incoming_message: dict | None) -> str:
-        source = incoming_message if isinstance(incoming_message, dict) else None
-        if source is None:
-            for message in reversed(request_messages):
-                if message.get("role") == "user":
-                    source = message
-                    break
-        if source is None:
-            return ""
-        content = source.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            return " ".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
-        return str(content or "")
-
-    def _knowledge_block(self, store: Any) -> str:
-        with self._lock:
-            stamped, block = self._knowledge
-            # Проверяем время, а не наличие текста: пока знания нет вовсе, пустой ответ —
-            # такой же ответ, и ходить за ним в базу на каждом обращении незачем.
-            if stamped and time.monotonic() - stamped < KNOWLEDGE_TTL:
-                return block
-        rows = [{"content": row[0], "memory_type": row[1]} for row in store._execute_guarded(P1_SQL, {})]
-        block = build_knowledge_block(rows, KNOWLEDGE_BUDGET)
-        with self._lock:
-            self._knowledge = (time.monotonic(), block)
-        return block
-
-    def _dynamic_blocks(self, store: Any, question: str) -> tuple[str, str]:
-        """Найденное под вопрос: записи по смыслу и куски давнего разговора.
-
-        Один поиск на оба блока: разговорные строки лежат в той же таблице, что и факты,
-        и отличаются только типом.
-        """
-        question = (question or "").strip()
-        if not question:
-            return "", ""
-        key = question[:400]
-        with self._lock:
-            stamped, cached_key, cached = self._dynamic
-            if cached_key == key and time.monotonic() - stamped < DYNAMIC_TTL:
-                return cached, ""
-
-        found = store.recall(question, RECALL_LIMIT + OLD_HISTORY_LIMIT)
-        facts = [row for row in found if row.get("memory_type") != "dialogue"][:RECALL_LIMIT]
-        talk = [row for row in found if row.get("memory_type") == "dialogue"][:OLD_HISTORY_LIMIT]
-        recalled = build_recalled_block(facts, RECALLED_BUDGET)
-        old_history = build_old_history_block(talk, OLD_HISTORY_BUDGET)
-        # Оператор договорился, что подъём памяти всегда видно. Ищет теперь движок, но
-        # отметку по-прежнему ставит память — число едет к ней отсюда.
-        self._recall_signal.publish(len(facts) + len(talk))
-
-        with self._lock:
-            self._dynamic = (time.monotonic(), key, "\n\n".join(b for b in (recalled, old_history) if b))
-        return recalled, old_history
+    def _load_knowledge(self, budget: int) -> str | None:
+        """Ядро из общей памяти. None — прочитать не удалось, попробуем на следующем запросе."""
+        store = self._get_store()
+        if store is None:
+            return None
+        rows = store.core_rows()
+        if rows is None:
+            return None
+        return build_knowledge_block(rows, budget)
 
     def _get_store(self) -> Any:
-        """Та же база, что у памяти Гермеса. Второго подключения не заводим."""
-        if self._store is not None or self._store_tried:
-            return self._store
-        self._store_tried = True
+        """Та же база, что у памяти Гермеса. Не получилось — пробуем снова через минуту, а не
+        никогда: одна неудача при запуске не должна оставлять разговор без ядра до перезапуска."""
+        with self._lock:
+            if self._store is not None:
+                return self._store
+            if time.monotonic() < self._store_retry_at:
+                return None
+            self._store_retry_at = time.monotonic() + 60.0
         try:
             from agent.secret_scope import get_secret
             from plugins.memory.aida import _Store
 
             url = get_secret("SUPABASE_DB_URL", "") or ""
             if not url:
-                logger.info("Витрина: общая память не настроена, движок не вмешивается")
+                (logger.warning if not self._announced_no_url else logger.debug)("Витрина: SUPABASE_DB_URL не задан — движок ведёт хвост, но без ядра из памяти")
+                self._announced_no_url = True
                 return None
-            self._store = _Store(url, get_secret("OPENROUTER_API_KEY", "") or "")
+            store = _Store(url, get_secret("OPENROUTER_API_KEY", "") or "")
         except Exception:
-            logger.warning("Витрина: подключиться к общей памяти не удалось", exc_info=True)
-            self._store = None
-        return self._store
-
-    def on_session_end(self, session_id: str, messages: list[dict]) -> None:
-        if self._store is not None:
-            self._store.close()
-            self._store = None
-            self._store_tried = False
+            logger.warning("Витрина: подключиться к общей памяти не удалось, повтор через минуту", exc_info=True)
+            return None
+        with self._lock:
+            self._store = store
+        return store
 
 
 def register(ctx) -> None:

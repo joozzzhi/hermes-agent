@@ -28,9 +28,12 @@ CHUNK_BUDGET = 1900
 # every row this plugin ever wrote removable with one condition.
 SOURCE_PREFIX = "hermes:"
 
+# created_at is when the thing was SAID. A turn that waited in the local queue for the store
+# to come back must not be dated by its delivery: recall quotes the date to the model.
 INSERT_SQL = """
-INSERT INTO memories (memory_type, content, priority, chat_id, role, status, last_accessed)
-VALUES (%(memory_type)s, %(content)s, %(priority)s, %(chat_id)s, %(role)s, 'active', now())
+INSERT INTO memories (memory_type, content, priority, chat_id, role, status, last_accessed, created_at)
+VALUES (%(memory_type)s, %(content)s, %(priority)s, %(chat_id)s, %(role)s, 'active', now(),
+        coalesce(%(created_at)s::timestamptz, now()))
 RETURNING id
 """
 
@@ -61,6 +64,14 @@ PRIORITIES = ("P1", "P2", "P3")
 ROLES = ("assistant", "user", "system")
 
 _SPLIT_AT = re.compile(r"(?<=[.!?…])\s+|\n+")
+
+
+def scrub(text: str) -> str:
+    """Mask credentials before conversation text is kept or sent anywhere (queue, Postgres,
+    embeddings, the nightly distiller): a key pasted into a chat must not become a memory."""
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text(text or "", force=True, redact_url_credentials=True)
 
 
 def source_tag(session_id: str = "") -> str:
@@ -115,13 +126,15 @@ def chunk_content(content: str, budget: int = CHUNK_BUDGET) -> list[str]:
     return [f"[часть {index}/{total}] {piece}" for index, piece in enumerate(pieces, start=1)]
 
 
-def insert_params(content: str, *, memory_type: str, priority: str, role: str, chat_id: str) -> dict:
+def insert_params(content: str, *, memory_type: str, priority: str, role: str, chat_id: str,
+                  created_at: str | None = None) -> dict:
     return {
         "content": content,
         "memory_type": normalise_type(memory_type),
         "priority": normalise_priority(priority),
         "role": normalise_role(role),
         "chat_id": chat_id,
+        "created_at": created_at or None,
     }
 
 

@@ -6,10 +6,15 @@ on that same table, so what was said in Telegram in July is available here witho
 retold — and, by the operator's decision, it is presented as Hermes's OWN past, not as a
 quotation from another assistant.
 
-This is step one of three: it RECALLS and writes nothing. Deliberate writes, mirrored
-memory-tool writes and the nightly verbatim shipment come in the later steps, so that a
-mistake here can only ever fail to remember something — never damage the store that the
-bot depends on.
+Three tiers, the way the engine on the server had them. The CORE (priority P1, written on
+purpose) always stands in the system prompt — the context engine puts it there. FACTS and
+lines of past DIALOGUE are found by the question of the turn and handed to the host through
+``prefetch()``: the host stamps them into that turn's user message for good, so the request
+only ever grows at its end and the provider's prompt cache survives from turn to turn.
+
+A finished turn goes into the store at once, verbatim. What needs a model — pulling lasting
+facts out of the conversation — waits until the operator has been silent for an hour
+(``idle.py``): by then the provider's cache is cold anyway, and nothing is disturbed.
 
 Configuration: ``SUPABASE_DB_URL`` (required, scoped secret) and ``OPENROUTER_API_KEY``
 (optional — enables searching by meaning as well as by word).
@@ -27,15 +32,22 @@ from agent.memory_provider import MemoryProvider, RecallStatus, spawn_context_th
 from agent.secret_scope import get_secret
 from tools.registry import tool_error
 
-from . import recall_signal
+from . import idle
 from .queue_db import TurnQueue
 from .search import (
-    FTS_SQL,
-    VECTOR_SQL,
+    CORE_SQL,
+    DIALOGUE_CAP,
+    DISTILLER_SOURCE,
+    above_vector_floor,
     combine_rrf,
     format_block,
+    format_recall,
+    fts_sql,
+    pick_facts,
     row_to_memory,
+    same_fact,
     to_vector_literal,
+    vector_sql,
 )
 from .write import (
     ARCHIVE_SQL,
@@ -49,6 +61,7 @@ from .write import (
     describe_saved,
     insert_params,
     normalise_type,
+    scrub,
     source_tag,
 )
 
@@ -60,6 +73,9 @@ logger = logging.getLogger(__name__)
 EMBEDDING_MODEL = "nvidia/llama-nemotron-embed-vl-1b-v2:free"
 EMBEDDING_URL = "https://openrouter.ai/api/v1/embeddings"
 EMBEDDING_TIMEOUT = 12.0
+# The question of a turn is embedded while the operator waits for the answer to start. If the
+# service is slow, the words of the question still find what they can.
+QUERY_EMBEDDING_TIMEOUT = 4.0
 
 # A query must never outlive the turn it was meant for. The manager abandons a stuck
 # provider thread rather than killing it, so the ceiling lives here.
@@ -71,6 +87,10 @@ BACKOFF_SECONDS = 60.0
 
 DEFAULT_LIMIT = 8
 MAX_LIMIT = 20
+
+# Shorter than this is "ок", "ага", "поправляй" (the bot's threshold, measured on its own
+# chats). Such a reply asks nothing, yet its two letters match half the store.
+MIN_QUESTION_LENGTH = 12
 
 # A deliberate lookup may show a stored entry whole (the column caps it at 2000 characters);
 # the automatic per-turn block is trimmed harder — see ENTRY_BUDGET in search.py.
@@ -114,9 +134,9 @@ def _turn_called_remember(messages: list[dict[str, Any]] | None) -> bool:
     """
     if not messages:
         return False
-    # ``messages`` is the WHOLE conversation, not this turn: one aida_remember a week ago would
-    # otherwise mark every later turn of a long-lived chat as "already saved" and nothing from
-    # it would ever reach the store again. This turn starts at the last real user message.
+    # The host hands over the conversation SO FAR, not the turn. Reading all of it meant that
+    # one ``aida_remember`` anywhere in a long session silenced the keeping of every later
+    # turn — in a session that never ends, that is everything after the first week.
     start = 0
     for index in range(len(messages) - 1, -1, -1):
         message = messages[index]
@@ -214,7 +234,7 @@ class _Store:
 
     # -- embeddings ------------------------------------------------------------------
 
-    def _embed_all(self, texts: list[str]) -> list[list[float]] | None:
+    def _embed_all(self, texts: list[str], timeout: float | None = None) -> list[list[float]] | None:
         """Vectors for one or more texts, or None when the service is not answering at all."""
         if not self._api_key or not texts:
             return None
@@ -224,8 +244,8 @@ class _Store:
             response = requests.post(
                 EMBEDDING_URL,
                 headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
-                json={"model": EMBEDDING_MODEL, "input": texts},
-                timeout=EMBEDDING_TIMEOUT * max(1, len(texts) // 4),
+                json={"model": EMBEDDING_MODEL, "input": [scrub(text) for text in texts]},
+                timeout=timeout or EMBEDDING_TIMEOUT * max(1, len(texts) // 4),
             )
             response.raise_for_status()
             data = response.json().get("data") or []
@@ -235,15 +255,25 @@ class _Store:
             logger.debug("Aida memory: embedding unavailable, searching by words only (%s)", exc)
             return None
 
-    def _embed(self, text: str) -> list[float] | None:
+    def _embed(self, text: str, timeout: float | None = None) -> list[float] | None:
         """Vector for the question, or None — a missing vector costs ranking, not recall."""
-        vectors = self._embed_all([text])
+        vectors = self._embed_all([text], timeout=timeout)
         return vectors[0] if vectors and vectors[0] else None
 
     # -- recall ----------------------------------------------------------------------
 
+    def _search(self, kind: str, query: str, vector: list[float] | None, limit: int) -> list[dict]:
+        """One tier, both halves, fused. Call with the lock held; raises on a database failure."""
+        fts_hits = self._fetch(fts_sql(kind), {"query": query, "limit": limit})
+        vector_hits: list[dict] = []
+        if vector is not None:
+            vector_hits = above_vector_floor(
+                self._fetch(vector_sql(kind), {"vec": to_vector_literal(vector), "limit": limit * 2})
+            )
+        return combine_rrf(vector_hits, fts_hits)
+
     def recall(self, query: str, limit: int = DEFAULT_LIMIT) -> list[dict]:
-        """Hybrid recall. Returns [] when the store is unreachable — never raises upward."""
+        """A deliberate lookup over everything. Returns [] when the store is unreachable."""
         query = (query or "").strip()
         if not query:
             return []
@@ -252,48 +282,125 @@ class _Store:
         vector = self._embed(query)
         with self._lock:
             try:
-                fts_hits = self._fetch(FTS_SQL, {"query": query, "limit": limit})
-                vector_hits: list[dict] = []
-                if vector is not None:
-                    vector_hits = self._fetch(
-                        VECTOR_SQL, {"vec": to_vector_literal(vector), "limit": limit * 2}
-                    )
+                found = self._search("all", query, vector, limit)
                 self._blocked_until = 0.0
             except Exception as exc:
                 self._blocked_until = time.monotonic() + BACKOFF_SECONDS
                 logger.warning("Aida memory unreachable, answering without it: %s", exc)
                 return []
-        return combine_rrf(vector_hits, fts_hits)[:limit]
+        return found[:limit]
+
+    def recall_tiers(self, query: str) -> tuple[list[dict], list[dict]] | None:
+        """What one question raises: facts and lines of past dialogue, searched apart.
+
+        None means the store could not be asked at all — the caller must be able to tell
+        "nothing was found" from "nobody looked".
+        """
+        query = (query or "").strip()
+        if not query:
+            return [], []
+        if time.monotonic() < self._blocked_until:
+            return None
+        vector = self._embed(query, timeout=QUERY_EMBEDDING_TIMEOUT)
+        with self._lock:
+            try:
+                facts = self._search("facts", query, vector, 20)
+                dialogue = self._search("dialogue", query, vector, DIALOGUE_CAP * 2)
+                self._blocked_until = 0.0
+            except Exception as exc:
+                self._blocked_until = time.monotonic() + BACKOFF_SECONDS
+                logger.warning("Aida memory unreachable, answering without it: %s", exc)
+                return None
+        return pick_facts(facts), dialogue[:DIALOGUE_CAP]
+
+    # -- keeping the store from becoming a warehouse --------------------------------------
+
+    def knows(self, content: str) -> bool:
+        """Is this fact already in memory, in these or other words? A database failure answers
+        "no": a possible duplicate is cheaper than a fact dropped because the store hiccuped."""
+        content = (content or "").strip()
+        if not content or time.monotonic() < self._blocked_until:
+            return False
+        with self._lock:
+            try:
+                candidates = self._fetch(fts_sql("known"), {"query": content, "limit": 5})
+            except Exception as exc:
+                logger.debug("Aida memory: could not check for a known fact (%s)", exc)
+                return False
+        return any(same_fact(content, item.get("content")) for item in candidates)
+
+    def mark_used(self, ids: list[int]) -> None:
+        """A memory was put in front of the model. This is what a fact on probation is judged by."""
+        if ids:
+            self._execute_guarded(
+                "UPDATE memories SET access_count = access_count + 1, last_accessed = now() "
+                "WHERE id = ANY(%(ids)s)", {"ids": [int(i) for i in ids]},
+            )
+
+    def settle_probation(self, days: float) -> tuple[int, int]:
+        """Facts the distiller wrote start on probation (P3). One that has been recalled since
+        is kept as an ordinary fact; one that nobody needed in ``days`` stops surfacing. The row
+        stays in the table either way. Returns (kept, archived)."""
+        source = {"source": DISTILLER_SOURCE}
+        kept = self._execute_guarded(
+            "UPDATE memories SET priority = 'P2' WHERE chat_id = %(source)s AND priority = 'P3' "
+            "AND status = 'active' AND memory_type <> 'dialogue' AND access_count > 0 RETURNING id", source)
+        archived = self._execute_guarded(
+            "UPDATE memories SET status = 'archived' WHERE chat_id = %(source)s AND priority = 'P3' "
+            "AND status = 'active' AND memory_type <> 'dialogue' AND access_count = 0 "
+            "AND created_at < now() - make_interval(secs => %(seconds)s) RETURNING id",
+            {**source, "seconds": float(days) * 86400.0})
+        return len(kept), len(archived)
+
+    def core_rows(self) -> list[dict] | None:
+        """The core: every P1 entry written on purpose. None when the store did not answer."""
+        if time.monotonic() < self._blocked_until:
+            return None
+        with self._lock:
+            try:
+                rows = self._execute(CORE_SQL, {})
+                self._blocked_until = 0.0
+            except Exception as exc:
+                self._blocked_until = time.monotonic() + BACKOFF_SECONDS
+                logger.warning("Aida memory: the core could not be read: %s", exc)
+                return None
+        return [{"content": row[0], "memory_type": row[1], "created_at": row[2]} for row in rows]
 
     # -- writing ---------------------------------------------------------------------
 
     def save(self, content: str, *, memory_type: str = "fact", priority: str = "P2",
-             role: str = "assistant", chat_id: str = "", embed: bool = True) -> list[int]:
+             role: str = "assistant", chat_id: str = "", embed: bool = True,
+             created_at: str | None = None, dedupe: bool = True) -> list[int]:
         """Write one memory, split into parts if it is too long. Returns the row ids written.
 
         Raises nothing upward on a database failure — the caller is a turn in progress, and a
         memory that could not be written is worth a warning, not a broken conversation.
+        ``dedupe=False`` is for lines of conversation: "да" said twice was said twice.
         """
-        chunks = chunk_content(content)
+        chunks = chunk_content(scrub(content))
         if not chunks:
+            return []
+        if time.monotonic() < self._blocked_until:
             return []
         written: list[int] = []
         with self._lock:
             try:
                 for chunk in chunks:
-                    duplicate = self._execute(
+                    if dedupe and self._execute(
                         DUPLICATE_SQL, {"content": chunk, "source": SOURCE_PREFIX + "%"}
-                    )
-                    if duplicate:
+                    ):
                         continue
                     rows = self._execute(
                         INSERT_SQL,
-                        insert_params(chunk, memory_type=memory_type, priority=priority,
-                                      role=role, chat_id=chat_id or source_tag()),
+                        insert_params(chunk, memory_type=memory_type, priority=priority, role=role,
+                                      chat_id=chat_id or source_tag(), created_at=created_at),
                     )
                     if rows:
                         written.append(int(rows[0][0]))
             except Exception as exc:
+                # The back-off is what lets a caller tell "the store refused" from "there was
+                # nothing to write" (see alive()); without it a failed turn looked delivered.
+                self._blocked_until = time.monotonic() + BACKOFF_SECONDS
                 logger.warning("Aida memory: could not write, the thought stays unsaved: %s", exc)
                 return []
         if embed and written:
@@ -384,10 +491,8 @@ class AidaMemoryProvider(MemoryProvider):
         self._session_id: str = ""
         self._writes_enabled: bool = True
         self._lock = threading.Lock()
-        self._pending: str = ""
-        self._pending_count: int = 0
         self._last_count: int | None = None
-        self._thread: threading.Thread | None = None
+        self._home: Path | None = None
 
     @property
     def name(self) -> str:
@@ -424,11 +529,22 @@ class AidaMemoryProvider(MemoryProvider):
         # a flush would otherwise fill the shared memory with work nobody said out loud.
         self._writes_enabled = str(kwargs.get("agent_context", "primary") or "primary") == "primary"
         home = Path(str(kwargs.get("hermes_home") or "."))
+        self._home = home
         try:
             self._queue = TurnQueue(home / "aida_queue.db")
         except Exception as exc:
-            logger.warning("Aida memory: the local queue is unavailable, turns will not be kept: %s", exc)
+            logger.warning("Aida memory: the local queue is unavailable, turns will not be distilled: %s", exc)
             self._queue = None
+        if self._queue is not None and self._writes_enabled:
+            # The idle timer lives in the process. A conversation left in the queue by a
+            # process that was restarted mid-count is picked up here.
+            idle.check_on_start(home, self._queue)
+
+    def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False,
+                          rewound: bool = False, **kwargs) -> None:
+        """The host renumbers the session without restarting us (compression, /new, /resume)."""
+        if new_session_id:
+            self._session_id = new_session_id
 
     def system_prompt_block(self) -> str:
         return (
@@ -437,8 +553,11 @@ class AidaMemoryProvider(MemoryProvider):
             "this terminal, Telegram, coding sessions. Everything recalled from it is YOUR OWN past "
             "with him, including conversations from before this machine existed: speak of it in the "
             "first person, never as another assistant's transcript.\n"
-            "Recalled entries arrive automatically before your reply. Use `aida_recall` when you need "
-            "to look something up on purpose. Memory is quoted, not guessed — if it is not there, say so.\n"
+            "What is relevant to the operator's message arrives with it, inside <memory-context>: facts "
+            "whole, lines of old conversation as dated quotes cut to their opening. Use `aida_recall` to "
+            "read a quote in full or to look something up on purpose — and always before answering "
+            "about past decisions, plans or events when nothing relevant arrived. Memory is quoted, "
+            "not guessed — if it is not there, say so.\n"
             "Use `aida_remember` for something that must outlive this conversation — a decision, a "
             "preference, an arrangement, a fact about him. One thought per call, written so it still "
             "makes sense in a month. The conversation itself is kept without you doing anything."
@@ -446,73 +565,74 @@ class AidaMemoryProvider(MemoryProvider):
 
     # -- recall lifecycle --------------------------------------------------------------
 
-    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        """Recall in the background after a turn; :meth:`prefetch` hands it over on the next."""
-        if self._store is None:
-            return
-        if recall_signal.engine_is_assembling():
-            # The context engine assembles the window from this same store, and it does so
-            # for the question being asked rather than the one before it. Searching again
-            # here would put a second copy of the same memories into the request.
-            return
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=2.0)
-            if self._thread.is_alive():
-                logger.debug("Aida memory: previous recall still running, skipping this one")
-                return
-        self._thread = spawn_context_thread(self._recall_into_cache, args=(query,), name="aida-recall")
-        self._thread.start()
-
-    def _recall_into_cache(self, query: str) -> None:
-        memories = self._store.recall(query) if self._store else []
-        with self._lock:
-            self._pending = format_block(memories)
-            self._pending_count = len(memories)
-
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        with self._lock:
-            block, count = self._pending, self._pending_count
-            self._pending, self._pending_count = "", 0
-            self._last_count = count
+        """Search for THIS question, now. The host stamps what comes back into the turn's user
+        message and replays those bytes on every later request, so it is found once per turn
+        and never moves again — which is what keeps the provider's prompt cache alive.
+
+        The base class asks for a cached answer prepared after the previous turn. That answers
+        the previous question; the lookup here takes a fraction of a second and the host bounds
+        it with its own timeout.
+        """
+        self._last_count = None
+        if self._store is None or len((query or "").strip()) < MIN_QUESTION_LENGTH:
+            return ""
+        tiers = self._store.recall_tiers(query)
+        if tiers is None:
+            return ""
+        block, shown = format_recall(*tiers)
+        self._last_count = shown
+        if block:
+            # Off the reply's path: the count only matters to the next tidy-up.
+            used = [item["id"] for item in tiers[0]]
+            spawn_context_thread(self._store.mark_used, args=(used,), name="aida-used").start()
         return block
 
-    def recall_status(self) -> RecallStatus | None:
-        """What the LAST recall injected. The operator asked to always see that memory was
-        consulted, including when it came back with nothing — so a completed recall with no
-        hits still reports, and only "no recall happened at all" stays silent.
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        """Nothing to prepare in advance — see :meth:`prefetch`."""
 
-        When the context engine is the one assembling, the count comes from it: the search
-        happens once, and the indicator still tells the operator what was raised."""
-        count = recall_signal.last_count() if recall_signal.engine_is_assembling() else self._last_count
-        if count is None:
+    def recall_status(self) -> RecallStatus | None:
+        """What the LAST recall put into the turn, for the indicator above the reply."""
+        if not self._last_count:
             return None
-        return RecallStatus(provider_label="Память", count=count)
+        return RecallStatus(provider_label="Память", count=self._last_count)
 
     # -- writing -----------------------------------------------------------------------
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "",
                   messages: list[dict[str, Any]] | None = None, **kwargs) -> None:
-        """Keep the turn locally; the nightly job carries it to the shared store.
+        """Keep the turn: verbatim into the shared store now, and into the local queue to be
+        distilled when the operator falls silent.
 
-        Nothing here talks to the database — an answer must not wait on the network, and a
-        day's conversation is worth one batch rather than two round trips per reply.
+        The host calls this on its background worker after the reply is out, so the round
+        trip to the database costs the operator nothing. Writing at once is what makes a
+        conversation findable an hour later instead of the next morning — and what survives
+        a restart, a /new or a tail that has moved on. If the store is down the turn waits in
+        the queue unshipped and is delivered by the next pass with its own time on it.
 
-        A turn where the agent already called ``aida_remember`` on itself is skipped here:
-        that write is already in the store, deliberate and phrased by the agent. Queuing the
-        same turn would hand it to the nightly distiller a second time, which reads it fresh
-        and words it differently — the dedup in ``write.py`` matches on exact text, so a
-        second phrasing of the same fact would sail right past it and double up in recall.
+        A turn where the agent already called ``aida_remember`` is still kept verbatim, but
+        not distilled: the fact is in the store, phrased by the agent, and a second phrasing
+        of it would sail past the exact-text dedup and double up in recall.
         """
-        if self._queue is None or not self._writes_enabled:
-            return
-        if _turn_called_remember(messages):
+        if not self._writes_enabled:
             return
         session = session_id or self._session_id
-        try:
-            self._queue.enqueue(session, "user", user_content)
-            self._queue.enqueue(session, "assistant", assistant_content)
-        except Exception as exc:
-            logger.debug("Aida memory: could not queue the turn (%s)", exc)
+        distill = not _turn_called_remember(messages)
+        for role, content in (("user", user_content), ("assistant", assistant_content)):
+            shipped = False
+            if self._store is not None:
+                shipped = bool(self._store.save(
+                    content, memory_type="dialogue", priority="P3", role=role,
+                    chat_id=source_tag(session), dedupe=False,
+                ))
+            if self._queue is None:
+                continue
+            try:
+                self._queue.enqueue(session, role, content, shipped=shipped, distill=distill)
+            except Exception as exc:
+                logger.warning("Aida memory: could not queue the turn for distilling (%s)", exc)
+        if self._queue is not None and self._home is not None:
+            idle.touch(self._home)
 
     def on_memory_write(self, action: str, target: str, content: str,
                         metadata: dict[str, Any] | None = None) -> None:
@@ -581,8 +701,6 @@ class AidaMemoryProvider(MemoryProvider):
         return describe_saved(chunk_content(content), memory_type)
 
     def shutdown(self) -> None:
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
         if self._store is not None:
             self._store.close()
         if self._queue is not None:
