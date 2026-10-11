@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import re
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -442,3 +444,75 @@ def test_an_assembly_that_blows_up_hands_the_request_back_untouched(monkeypatch)
     monkeypatch.setattr(engine_module, "select_tail", boom)
 
     assert _engine(_Store()).select_context(_request()) is None
+
+
+# -- вывод инструментов: потолок, диск, журнал ---------------------------------------------
+
+
+def _web_session(exchanges: int = 12) -> list[dict]:
+    """Проверка готовности: переписка, потом 5 веб-поисков и 2 тяжёлые страницы подряд."""
+    request = [{"role": "system", "content": "личность " + "с" * 20_000}]
+    for index in range(exchanges):
+        request += [{"role": "user", "content": f"karma {index} " + "к" * 400},
+                    {"role": "assistant", "content": f"жиши {index} " + "ж" * 1_200}]
+    request.append({"role": "user", "content": "найди и сравни"})
+    for index in range(7):
+        name = "web_search" if index < 5 else "web_extract"
+        size = 14_000 if index < 5 else 90_000
+        body = f"{name} {index} начало\n" + "\n".join(f"строка {n} " + "в" * 60 for n in range(size // 70)) + "\nконец"
+        request += [{"role": "assistant", "content": "",
+                     "tool_calls": [{"id": f"w{index}", "type": "function",
+                                     "function": {"name": name, "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": f"w{index}", "name": name, "content": body}]
+    request.append({"role": "assistant", "content": "сравнил"})
+    return request
+
+
+def test_after_heavy_web_work_the_talk_is_whole_and_every_output_is_capped(monkeypatch, caplog):
+    monkeypatch.setenv("AIDA_CONTEXT_TOKENS", "60000")
+    request = _web_session()
+    eng = _engine(_Store())
+
+    with caplog.at_level("INFO", logger="plugins.context_engine.aida"):
+        selected = eng.select_context(request, budget_tokens=1_000_000)
+        eng.on_turn_complete(request)
+
+    questions = [m["content"] for m in request if m["role"] == "user"]
+    sent = [m["content"] for m in selected if m["role"] == "user"]
+    assert sent[-engine_module.PROTECTED_EXCHANGES:] == questions[-engine_module.PROTECTED_EXCHANGES:]
+    for original, out in zip([m for m in request if m["role"] == "tool"], [m for m in selected if m["role"] == "tool"]):
+        assert len(out["content"]) <= engine_module.TOOL_RESULT_CAP
+        path = re.search(r"полный — (\S+?);", out["content"]) or re.search(r"полный вывод: (\S+)", out["content"])
+        if len(original["content"]) > engine_module.TOOL_RESULT_CAP:
+            assert path, out["content"][:200]
+            assert Path(path.group(1)).read_text(encoding="utf-8") == original["content"]
+            if out["content"].startswith("[вывод урезан"):      # свежий — начало и конец
+                assert out["content"].endswith("конец")
+            else:                                             # старый — заглушка со ссылкой
+                assert "отпущен из запроса" in out["content"]
+    line = next(r.getMessage() for r in caplog.records if "ход — ядро" in r.getMessage())
+    assert "переписка" in line and "инструменты" in line and "заглушек" in line
+
+
+def test_capping_gives_the_same_bytes_on_every_request(monkeypatch):
+    monkeypatch.setenv("AIDA_CONTEXT_TOKENS", "60000")
+    request = _web_session()
+    eng = _engine(_Store())
+
+    first = eng.select_context(request, budget_tokens=1_000_000)
+    again = eng.select_context(request + [{"role": "user", "content": "ещё"}], budget_tokens=1_000_000)
+    restarted = _engine(_Store()).select_context(request, budget_tokens=1_000_000)
+
+    assert again[:len(first)] == first
+    assert restarted == first
+
+
+def test_an_output_that_could_not_be_saved_is_left_whole(monkeypatch):
+    monkeypatch.setattr(AidaContextEngine, "_saved_output", lambda self, state, message, content: None)
+    request = [{"role": "system", "content": "личность"}, {"role": "user", "content": "читай"},
+               {"role": "assistant", "content": "", "tool_calls": [{"id": "r1", "function": {"name": "read_file"}}]},
+               {"role": "tool", "tool_call_id": "r1", "content": "р" * 30_000}]
+
+    selected = _engine(_Store()).select_context(request)
+
+    assert selected[-1]["content"] == "р" * 30_000

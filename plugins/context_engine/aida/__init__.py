@@ -26,8 +26,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -37,8 +39,11 @@ from typing import Any
 from agent.context_engine import ContextEngine
 
 from .assembly import (
+    AGE_MIN_CHARS,
+    PROTECTED_EXCHANGES,
     TailState,
     apply_state,
+    breakdown,
     build_knowledge_block,
     count_aged,
     is_conversation_message,
@@ -79,6 +84,17 @@ DEFAULT_CACHE_TTL = CACHE_TTL_SECONDS["5m"]
 
 MAX_TRACKED_CONVERSATIONS = 64
 
+# Потолок одного вывода инструмента в окне. Замер по state.db обоих профилей (2208 результатов):
+# 95% результатов короче 12,3 тыс. знаков; длиннее — 4%, но это 21% всего выхлопа (read_file,
+# web_extract, длинный терминал). Остальное уходит на диск, в окне — начало, конец и путь.
+TOOL_RESULT_CAP = 12_000
+CAP_TAIL_CHARS = 2_500
+# Куда кладутся полные выводы. Не cache/spillover хозяина: тот чистится через сутки, а
+# заглушка в окне обещает, что оригинал можно достать и через неделю.
+TOOL_OUTPUT_SUBDIR = ("cache", "aida-tool-output")
+TOOL_OUTPUT_MAX_AGE_DAYS = 30
+_UNSAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
+
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -109,6 +125,7 @@ class _Conversation:
     knowledge: str | None = None  # None — ядро ещё не удалось прочитать
     last_seen: float = 0.0
     aged: int = 0
+    paths: dict = field(default_factory=dict)   # tool_call_id → полный вывод на диске
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -132,6 +149,10 @@ class AidaContextEngine(ContextEngine):
         self._announced_no_url = False
         self._chars_per_token = DEFAULT_CHARS_PER_TOKEN
         self._last_sent_chars = 0
+        self._report: dict | None = None
+        self._turn_requests = 0
+        self._turn_rebuilds = 0
+        self._pruned_homes: set[str] = set()
 
     # -- хозяйство -----------------------------------------------------------------
 
@@ -173,6 +194,20 @@ class AidaContextEngine(ContextEngine):
             logger.info("Витрина: отпущено %d старых сообщений, они остаются в памяти",
                         len(conversation) - len(kept))
         return system_head + kept
+
+    def on_turn_complete(self, messages: list[dict], usage: dict[str, Any] = None, **kwargs: Any) -> None:
+        """Строка в журнал на каждый ход: куда ушёл бюджет последнего запроса этого хода."""
+        report, self._report = self._report, None
+        requests, self._turn_requests = self._turn_requests, 0
+        rebuilds, self._turn_rebuilds = self._turn_rebuilds, 0
+        if report is None:
+            return
+        logger.info("Витрина: ход — ядро %d (система %d + знание %d), переписка %d, инструменты %d, "
+                    "заглушек %d, урезано по потолку %d; сообщений %d из %d, бюджет хвоста %d; "
+                    "запросов %d, пересборок %d",
+                    report["head"] + report["knowledge"], report["head"], report["knowledge"],
+                    report["conversation"], report["tools"], report["stubs"], report["capped"],
+                    report["sent"], report["total"], report["tail_budget"], requests, rebuilds)
 
     def on_session_reset(self) -> None:
         super().on_session_reset()
@@ -248,9 +283,18 @@ class AidaContextEngine(ContextEngine):
                 state.knowledge = fresh
         knowledge = state.knowledge or ""
 
-        head_size = sum(message_size(m) for m in system_head) + len(knowledge)
+        system_size = sum(message_size(m) for m in system_head)
+        head_size = system_size + len(knowledge)
         tail_budget = max(int(budget * MIN_TAIL_SHARE), budget - head_size)
-        tail, state.tail, rebased = select_tail(conversation, tail_budget, state.tail, force=cold)
+        conversation, capped = self._cap_tool_output(state, conversation)
+        tail, state.tail, rebased = select_tail(conversation, tail_budget, state.tail, force=cold,
+                                                paths=state.paths)
+        talk, tools, stubs = breakdown(tail)
+        self._turn_requests += 1
+        self._turn_rebuilds += int(rebased)
+        self._report = {"head": system_size, "knowledge": len(knowledge), "conversation": talk,
+                        "tools": tools, "stubs": stubs, "capped": capped, "sent": len(tail),
+                        "total": len(conversation), "tail_budget": tail_budget}
         if rebased:
             aged = count_aged(conversation, state.tail.aged)
             if aged > state.aged:
@@ -259,9 +303,73 @@ class AidaContextEngine(ContextEngine):
                 # которое мы только что убрали из запроса.
                 self._reset_read_dedup()
             state.aged = aged
-            logger.info("Витрина: хвост пересобран (%s) — %d сообщений из %d, заглушек %d",
-                        "после паузы" if cold else "перестал помещаться", len(tail), len(conversation), aged)
+            logger.info("Витрина: хвост пересобран (%s) — %d сообщений из %d, заглушек %d; "
+                        "переписка %d, инструменты %d знаков",
+                        "после паузы" if cold else "перестал помещаться", len(tail), len(conversation), aged,
+                        talk, tools)
         return merge_into_system(system_head, knowledge) + tail
+
+    # -- вывод инструментов ----------------------------------------------------------
+
+    def _cap_tool_output(self, state: _Conversation, conversation: list[dict]) -> tuple[list[dict], int]:
+        """Каждый длинный вывод инструмента — на диск (один раз), а в окно — не больше потолка.
+
+        Решение зависит только от самого сообщения, поэтому одинаковое на каждом запросе: байты
+        запроса не плывут и кеш не страдает. Не записалось на диск — вывод остаётся целым: потолок
+        не стоит того, чтобы потерять оригинал.
+        """
+        out = conversation
+        capped = 0
+        for index, message in enumerate(conversation):
+            content = message.get("content")
+            if message.get("role") != "tool" or not isinstance(content, str) or len(content) <= AGE_MIN_CHARS:
+                continue
+            path = self._saved_output(state, message, content)
+            if path is None or len(content) <= TOOL_RESULT_CAP:
+                continue
+            if out is conversation:
+                out = list(conversation)
+            out[index] = {**message, "content": capped_preview(content, path)}
+            capped += 1
+        return out, capped
+
+    def _output_dir(self):
+        from hermes_constants import get_hermes_home
+
+        directory = get_hermes_home().joinpath(*TOOL_OUTPUT_SUBDIR)
+        if str(directory) not in self._pruned_homes:
+            self._pruned_homes.add(str(directory))
+            cutoff = time.time() - TOOL_OUTPUT_MAX_AGE_DAYS * 86400
+            try:
+                for item in directory.iterdir():
+                    if item.is_file() and item.stat().st_mtime < cutoff:
+                        item.unlink()
+            except OSError:
+                pass
+        return directory
+
+    def _saved_output(self, state: _Conversation, message: dict, content: str) -> str | None:
+        call_id = str(message.get("tool_call_id") or "")
+        known = state.paths.get(call_id)
+        if known:
+            return known
+        digest = hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()[:12]
+        stem = _UNSAFE_NAME.sub("_", call_id)[:80].strip("._-") or "result"
+        name = message.get("name") or message.get("tool_name") or "tool"
+        target = self._output_dir() / f"{_UNSAFE_NAME.sub('_', str(name))[:40]}_{stem}_{digest}.txt"
+        try:
+            if not target.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                tmp = target.with_suffix(".part")
+                tmp.write_text(content, encoding="utf-8", errors="replace")
+                tmp.replace(target)
+        except OSError:
+            logger.warning("Витрина: не удалось сохранить вывод инструмента на диск", exc_info=True)
+            return None
+        path = str(target).replace("\\", "/")
+        if call_id:
+            state.paths[call_id] = path
+        return path
 
     def _conversation(self, key: int) -> _Conversation:
         with self._lock:
@@ -324,6 +432,17 @@ class AidaContextEngine(ContextEngine):
         with self._lock:
             self._store = store
         return store
+
+
+def capped_preview(content: str, path: str, cap: int = TOOL_RESULT_CAP, tail_chars: int = CAP_TAIL_CHARS) -> str:
+    """Начало и конец вывода и путь к полному файлу — всё вместе не длиннее `cap`."""
+    lines = content.count("\n") + 1
+    header = (f"[вывод урезан витриной: {len(content)} знаков, {lines} строк; полный — {path}; "
+              "дочитывай read_file с offset/limit, кусками по 100–150 строк]\n")
+    marker = "\n[… середина опущена — она в файле выше …]\n"
+    room = max(cap - len(header) - len(marker), 0)
+    tail_room = min(tail_chars, room // 3)
+    return header + content[:room - tail_room] + marker + (content[-tail_room:] if tail_room else "")
 
 
 def register(ctx) -> None:

@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import pytest
 
+import json
+
 from plugins.context_engine.aida.assembly import (
+    CONVERSATION_SHARE,
+    PROTECTED_EXCHANGES,
     STEP_KEEP,
+    breakdown,
 
     age_before,
     apply_state,
@@ -433,3 +438,108 @@ def test_an_aged_tail_still_never_starts_with_an_orphaned_result():
         assert tail[0]["role"] == "user"
         assert _pairs_intact(tail)
         assert sum(message_size(m) for m in tail) <= budget
+
+
+# -- переписка под защитой ----------------------------------------------------------------------
+
+
+def _talk(index: int, size: int = 1_500) -> list[dict]:
+    return [_user(f"karma {index} " + "к" * size), _assistant(f"жиши {index} " + "ж" * size)]
+
+
+def _tool_turn(index: int, calls: int = 6, size: int = 12_000) -> list[dict]:
+    turn = [_user(f"karma задача {index}")]
+    for c in range(calls):
+        call_id = f"t{index}_{c}"
+        turn += [_calls_tool(call_id, "terminal"), _tool_result("т" * size, call_id, "terminal")]
+    turn.append(_assistant(f"жиши итог {index}"))
+    return turn
+
+
+def _exchanges(tail: list[dict]) -> list[str]:
+    return [m["content"] for m in tail if m.get("role") == "user" and not m.get("tool_call_id")]
+
+
+def test_the_last_exchanges_survive_any_amount_of_tool_work():
+    # Вчерашний случай: несколько ходов с терминалом вытеснили переписку до трёх сообщений.
+    budget = 145_000
+    conversation = [m for i in range(20) for m in _talk(i)]
+    state = None
+    for index in range(12):
+        conversation = conversation + _tool_turn(index)
+        tail, state, _ = select_tail(conversation, budget, state)
+        questions = [m["content"] for m in conversation if m.get("role") == "user" and not m.get("tool_call_id")]
+        assert _exchanges(tail)[-PROTECTED_EXCHANGES:] == questions[-PROTECTED_EXCHANGES:]
+        assert tail_size(tail) <= budget
+        assert _pairs_intact(tail)
+
+
+def test_protected_answers_stay_verbatim_and_only_silent_tool_pairs_go():
+    budget = 60_000
+    conversation = [m for i in range(6) for m in _talk(i)] + [m for i in range(6) for m in _tool_turn(i)] + _talk(99)
+
+    tail, state, _ = select_tail(conversation, budget)
+
+    words = [m for m in conversation if m["role"] in ("user", "assistant") and not m.get("tool_calls")]
+    kept = [m for m in tail if m["role"] in ("user", "assistant") and not m.get("tool_calls")]
+    assert kept[-len(words[-2 * PROTECTED_EXCHANGES:]):] == words[-2 * PROTECTED_EXCHANGES:]
+    assert all(m in conversation for m in kept)                # ни слова не пересказано
+    assert _pairs_intact(tail) and tail[0]["role"] == "user"
+    roles = [m["role"] for m in tail if m["role"] != "tool"]
+    assert all(not (a == b == "user") for a, b in zip(roles, roles[1:]))
+
+
+def test_a_long_chain_now_keeps_the_conversation_before_it():
+    budget = 60_000
+    conversation = [m for i in range(10) for m in _talk(i, 800)] + _long_turn(pairs=120, size=3_000)
+
+    tail, _, _ = select_tail(conversation, budget)
+
+    assert _exchanges(tail)[-1] == "разбери, почему падает сборка"
+    assert len(_exchanges(tail)) > 1                            # переписка до цепочки осталась
+    assert tail[-1] == conversation[-1]
+    assert _pairs_intact(tail)
+    assert breakdown(tail)[0] <= budget * CONVERSATION_SHARE + 2_000
+
+
+def test_folded_turns_keep_the_request_append_only_until_the_next_rebuild():
+    budget = 60_000
+    conversation = [m for i in range(6) for m in _tool_turn(i)]
+    tail, state, _ = select_tail(conversation, budget)
+    for step in range(3):
+        grown = conversation + _talk(100 + step, 200)
+        new_tail, state, rebased = select_tail(grown, budget, state)
+        if not rebased:
+            assert new_tail[:len(tail)] == tail
+        conversation, tail = grown, new_tail
+
+
+def test_old_call_arguments_are_released_but_stay_a_valid_call():
+    big = json.dumps({"path": "a.py", "content": "x" * 5_000})
+    call = {"role": "assistant", "content": "",
+            "tool_calls": [{"id": "w1", "type": "function", "function": {"name": "write_file", "arguments": big}}]}
+    conversation = [_user("запиши"), call, _tool_result("ok", "w1"), _assistant("записал"), _user("дальше")]
+
+    aged = age_before(conversation, 2)
+
+    released = aged[1]["tool_calls"][0]
+    assert released["id"] == "w1" and released["function"]["name"] == "write_file"
+    assert "5" in json.loads(released["function"]["arguments"])["aida_released"]
+    assert conversation[1]["tool_calls"][0]["function"]["arguments"] == big
+
+
+def test_a_released_result_points_to_its_full_copy_on_disk():
+    conversation = [m for i in range(3) for m in _work_turn(i)]
+
+    aged = age_before(conversation, 4, {"c0": "C:/h/cache/aida-tool-output/read_file_c0.txt"})
+
+    assert "C:/h/cache/aida-tool-output/read_file_c0.txt" in aged[2]["content"]
+
+
+def test_the_breakdown_splits_words_from_tool_output():
+    tail = [_user("вопрос"), _calls_tool(), _tool_result("р" * 1_000), _assistant("ответ")]
+
+    talk, tools, stubs = breakdown(tail)
+
+    assert talk + tools == tail_size(tail)
+    assert tools >= 1_000 and stubs == 0
