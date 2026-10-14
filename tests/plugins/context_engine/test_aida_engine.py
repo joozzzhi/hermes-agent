@@ -516,3 +516,58 @@ def test_an_output_that_could_not_be_saved_is_left_whole(monkeypatch):
     selected = _engine(_Store()).select_context(request)
 
     assert selected[-1]["content"] == "р" * 30_000
+
+
+def _long_tool_request(size: int) -> list[dict]:
+    return [
+        {"role": "system", "content": "личность"},
+        {"role": "user", "content": "прочитай файл"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "function": {"name": "read_file"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "р" * size},
+    ]
+
+
+def test_each_profile_gets_its_own_settings_from_its_own_config(tmp_path, monkeypatch):
+    # Один шлюз, одна витрина, два профиля: потолок вывода берётся из config.yaml того профиля,
+    # чей это ход, а не из того, кто ходил первым. A → B → A.
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    monkeypatch.delenv("AIDA_CONTEXT_TOKENS", raising=False)
+    tight, loose = tmp_path / "tight", tmp_path / "loose"
+    for home, cap in ((tight, 5_000), (loose, 50_000)):
+        home.mkdir()
+        (home / "config.yaml").write_text(f"aida:\n  tool_result_cap: {cap}\n", encoding="utf-8")
+    eng = _engine(_Store())
+
+    def longest_output(home: Path) -> int:
+        token = set_hermes_home_override(home)
+        try:
+            out = eng.select_context(_long_tool_request(20_000))
+        finally:
+            reset_hermes_home_override(token)
+        return max(len(m["content"]) for m in out if m.get("role") == "tool")
+
+    assert longest_output(tight) <= 5_000
+    assert longest_output(loose) == 20_000
+    assert longest_output(tight) <= 5_000
+
+
+def test_without_a_section_the_settings_are_the_defaults(tmp_path, monkeypatch):
+    # Нет секции aida: — значения те же, что стояли константами; кривое значение не роняет ход.
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from plugins.context_engine.aida.settings import DEFAULTS, load_settings
+
+    for name in ("AIDA_CONTEXT_TOKENS", "AIDA_CONTEXT_SHARE", "AIDA_CACHE_TTL_SECONDS"):
+        monkeypatch.delenv(name, raising=False)
+    plain, broken = tmp_path / "plain", tmp_path / "broken"
+    plain.mkdir(); broken.mkdir()
+    (plain / "config.yaml").write_text("model:\n  default: x\n", encoding="utf-8")
+    (broken / "config.yaml").write_text("aida:\n  protected_exchanges: много\n  conversation_share: 0.3\n",
+                                        encoding="utf-8")
+    for home, expected in ((plain, DEFAULTS),
+                           (broken, DEFAULTS.__class__(conversation_share=0.3))):
+        token = set_hermes_home_override(home)
+        try:
+            assert load_settings() == expected
+        finally:
+            reset_hermes_home_override(token)

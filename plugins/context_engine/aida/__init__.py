@@ -38,6 +38,7 @@ from typing import Any
 
 from agent.context_engine import ContextEngine
 
+from .settings import DEFAULTS, AidaSettings, load_settings
 from .assembly import (
     AGE_MIN_CHARS,
     PROTECTED_EXCHANGES,
@@ -59,19 +60,20 @@ logger = logging.getLogger(__name__)
 
 # Бюджет запроса — доля окна модели, а не число: у окна в миллион токенов и у окна в двести
 # тысяч «много» значит разное. Нижняя граница нужна маленьким окнам, чтобы хвост не схлопнулся.
-CONTEXT_SHARE = 0.05
-MIN_CONTEXT_TOKENS = 60_000
-UNKNOWN_WINDOW_TOKENS = 50_000
+# Значения по умолчанию; профиль переопределяет их в секции `aida:` своего конфига (settings.py).
+CONTEXT_SHARE = DEFAULTS.context_share
+MIN_CONTEXT_TOKENS = DEFAULTS.min_context_tokens
+UNKNOWN_WINDOW_TOKENS = DEFAULTS.unknown_window_tokens
 # Ядро занимает не больше этой доли бюджета; что не влезло, находится поиском.
-KNOWLEDGE_SHARE = 0.2
+KNOWLEDGE_SHARE = DEFAULTS.knowledge_share
 # Хвосту остаётся не меньше этой доли, какой бы большой ни была системная часть хозяина.
-MIN_TAIL_SHARE = 0.4
+MIN_TAIL_SHARE = DEFAULTS.min_tail_share
 
 # Бюджет считается в знаках, потому что знаки можно посчитать, не трогая модель. Сколько знаков
 # в токене, заранее неизвестно (у русского текста около двух с половиной, у кода и JSON больше),
 # поэтому число уточняется по каждому ответу: поставщик сообщает, во сколько токенов обошёлся
 # запрос, а сколько в нём было знаков, движок знает сам.
-DEFAULT_CHARS_PER_TOKEN = 3.0
+DEFAULT_CHARS_PER_TOKEN = DEFAULTS.chars_per_token
 CHARS_PER_TOKEN_RANGE = (2.0, 4.5)
 CALIBRATE_FROM_CHARS = 60_000
 
@@ -87,26 +89,19 @@ MAX_TRACKED_CONVERSATIONS = 64
 # Потолок одного вывода инструмента в окне. Замер по state.db обоих профилей (2208 результатов):
 # 95% результатов короче 12,3 тыс. знаков; длиннее — 4%, но это 21% всего выхлопа (read_file,
 # web_extract, длинный терминал). Остальное уходит на диск, в окне — начало, конец и путь.
-TOOL_RESULT_CAP = 12_000
-CAP_TAIL_CHARS = 2_500
+TOOL_RESULT_CAP = DEFAULTS.tool_result_cap
+CAP_TAIL_CHARS = DEFAULTS.cap_tail_chars
 # Куда кладутся полные выводы. Не cache/spillover хозяина: тот чистится через сутки, а
 # заглушка в окне обещает, что оригинал можно достать и через неделю.
 TOOL_OUTPUT_SUBDIR = ("cache", "aida-tool-output")
-TOOL_OUTPUT_MAX_AGE_DAYS = 30
+TOOL_OUTPUT_MAX_AGE_DAYS = DEFAULTS.tool_output_max_age_days
 _UNSAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, "") or default)
-    except ValueError:
-        return default
-
-
-def cache_ttl_seconds() -> float:
-    """Жизнь кеша поставщика: явная настройка AIDA_CACHE_TTL_SECONDS, иначе — то, что настроено
+def cache_ttl_seconds(settings: AidaSettings | None = None) -> float:
+    """Жизнь кеша поставщика: явная настройка `aida.cache_ttl_seconds`, иначе — то, что настроено
     у хозяина в `prompt_caching.cache_ttl` (по умолчанию у него пять минут)."""
-    explicit = _env_float("AIDA_CACHE_TTL_SECONDS", 0.0)
+    explicit = (settings or load_settings()).cache_ttl_seconds
     if explicit > 0:
         return explicit
     try:
@@ -147,7 +142,8 @@ class AidaContextEngine(ContextEngine):
         self._store_retry_at = 0.0
         self._announced = False
         self._announced_no_url = False
-        self._chars_per_token = DEFAULT_CHARS_PER_TOKEN
+        # Стартовый курс берётся из настроек профиля при первом подсчёте бюджета.
+        self._chars_per_token: float | None = None
         self._last_sent_chars = 0
         self._report: dict | None = None
         self._turn_requests = 0
@@ -164,7 +160,7 @@ class AidaContextEngine(ContextEngine):
         # входят ещё описания инструментов, которых движок не видит, поэтому число выходит
         # чуть заниженным — то есть бюджет чуть строже, а не мягче.
         sent = self._last_sent_chars
-        if sent >= CALIBRATE_FROM_CHARS and self.last_prompt_tokens > 0:
+        if sent >= CALIBRATE_FROM_CHARS and self.last_prompt_tokens > 0 and self._chars_per_token is not None:
             low, high = CHARS_PER_TOKEN_RANGE
             measured = min(high, max(low, sent / self.last_prompt_tokens))
             self._chars_per_token = 0.7 * self._chars_per_token + 0.3 * measured
@@ -187,8 +183,12 @@ class AidaContextEngine(ContextEngine):
         if not conversation:
             return list(messages)
         head_size = sum(message_size(m) for m in system_head)
-        budget = max(self._budget_chars(self.context_length) - head_size, 1)
-        kept = apply_state(conversation, rebase(conversation, budget, age=False))
+        settings = load_settings()
+        budget = max(self._budget_chars(self.context_length, settings) - head_size, 1)
+        kept = apply_state(conversation, rebase(conversation, budget, age=False,
+                                                protect=settings.protected_exchanges,
+                                                talk_share=settings.conversation_share,
+                                                keep_share=settings.keep_results_share))
         if len(kept) < len(conversation):
             self.compression_count += 1
             logger.info("Витрина: отпущено %d старых сообщений, они остаются в памяти",
@@ -223,15 +223,17 @@ class AidaContextEngine(ContextEngine):
 
     # -- бюджет --------------------------------------------------------------------
 
-    def _budget_chars(self, window_tokens: int) -> int:
+    def _budget_chars(self, window_tokens: int, settings: AidaSettings | None = None) -> int:
         """Бюджет запроса в знаках: доля окна модели, пересчитанная по настоящему курсу токена."""
-        absolute = _env_float("AIDA_CONTEXT_TOKENS", 0.0)
-        if absolute > 0:
-            tokens = absolute
+        settings = settings or load_settings()
+        if self._chars_per_token is None:
+            self._chars_per_token = settings.chars_per_token or DEFAULT_CHARS_PER_TOKEN
+        if settings.context_tokens > 0:
+            tokens = settings.context_tokens
         elif window_tokens and window_tokens > 0:
-            tokens = max(MIN_CONTEXT_TOKENS, window_tokens * _env_float("AIDA_CONTEXT_SHARE", CONTEXT_SHARE))
+            tokens = max(settings.min_context_tokens, window_tokens * settings.context_share)
         else:
-            tokens = UNKNOWN_WINDOW_TOKENS
+            tokens = settings.unknown_window_tokens
         return int(tokens * self._chars_per_token)
 
     # -- витрина -------------------------------------------------------------------
@@ -245,15 +247,16 @@ class AidaContextEngine(ContextEngine):
             system_head, conversation = split_system(request_messages)
             if not conversation:
                 return None
+            settings = load_settings()
             if not self._announced:
                 # Один раз за запуск, чтобы «движок работает» было видно в журнале, а не
                 # выводилось из того, что ничего не сломалось.
                 self._announced = True
                 logger.info("Витрина: движок ведёт контекст этого разговора (бюджет — %.0f%% окна)",
-                            100 * _env_float("AIDA_CONTEXT_SHARE", CONTEXT_SHARE))
+                            100 * settings.context_share)
             state = self._conversation(message_key(conversation[0]))
             with state.lock:
-                assembled = self._assemble(state, system_head, conversation, budget_tokens)
+                assembled = self._assemble(state, system_head, conversation, budget_tokens, settings)
             if not any(is_conversation_message(m) for m in assembled):
                 # До модели доехал бы запрос без единого сообщения, а на такой поставщик
                 # отвечает отказом, который не повторяют: ход умер бы целиком. Разговор у нас
@@ -269,26 +272,28 @@ class AidaContextEngine(ContextEngine):
             return None
 
     def _assemble(self, state: _Conversation, system_head: list[dict], conversation: list[dict],
-                  budget_tokens: int) -> list[dict]:
+                  budget_tokens: int, settings: AidaSettings) -> list[dict]:
         now = time.monotonic()
         # Оператор молчал дольше жизни кеша: начало запроса всё равно будет прочитано заново,
         # так что это единственный момент, когда его можно менять даром.
-        cold = bool(state.last_seen) and now - state.last_seen > cache_ttl_seconds()
+        cold = bool(state.last_seen) and now - state.last_seen > cache_ttl_seconds(settings)
         state.last_seen = now
-        budget = self._budget_chars(budget_tokens)
+        budget = self._budget_chars(budget_tokens, settings)
 
         if state.knowledge is None or cold:
-            fresh = self._load_knowledge(int(budget * KNOWLEDGE_SHARE))
+            fresh = self._load_knowledge(int(budget * settings.knowledge_share))
             if fresh is not None:
                 state.knowledge = fresh
         knowledge = state.knowledge or ""
 
         system_size = sum(message_size(m) for m in system_head)
         head_size = system_size + len(knowledge)
-        tail_budget = max(int(budget * MIN_TAIL_SHARE), budget - head_size)
-        conversation, capped = self._cap_tool_output(state, conversation)
+        tail_budget = max(int(budget * settings.min_tail_share), budget - head_size)
+        conversation, capped = self._cap_tool_output(state, conversation, settings)
         tail, state.tail, rebased = select_tail(conversation, tail_budget, state.tail, force=cold,
-                                                paths=state.paths)
+                                                paths=state.paths, protect=settings.protected_exchanges,
+                                                talk_share=settings.conversation_share,
+                                                keep_share=settings.keep_results_share)
         talk, tools, stubs = breakdown(tail)
         self._turn_requests += 1
         self._turn_rebuilds += int(rebased)
@@ -311,7 +316,8 @@ class AidaContextEngine(ContextEngine):
 
     # -- вывод инструментов ----------------------------------------------------------
 
-    def _cap_tool_output(self, state: _Conversation, conversation: list[dict]) -> tuple[list[dict], int]:
+    def _cap_tool_output(self, state: _Conversation, conversation: list[dict],
+                         settings: AidaSettings = DEFAULTS) -> tuple[list[dict], int]:
         """Каждый длинный вывод инструмента — на диск (один раз), а в окно — не больше потолка.
 
         Решение зависит только от самого сообщения, поэтому одинаковое на каждом запросе: байты
@@ -325,11 +331,12 @@ class AidaContextEngine(ContextEngine):
             if message.get("role") != "tool" or not isinstance(content, str) or len(content) <= AGE_MIN_CHARS:
                 continue
             path = self._saved_output(state, message, content)
-            if path is None or len(content) <= TOOL_RESULT_CAP:
+            if path is None or len(content) <= settings.tool_result_cap:
                 continue
             if out is conversation:
                 out = list(conversation)
-            out[index] = {**message, "content": capped_preview(content, path)}
+            out[index] = {**message, "content": capped_preview(content, path, settings.tool_result_cap,
+                                                               settings.cap_tail_chars)}
             capped += 1
         return out, capped
 
@@ -339,7 +346,7 @@ class AidaContextEngine(ContextEngine):
         directory = get_hermes_home().joinpath(*TOOL_OUTPUT_SUBDIR)
         if str(directory) not in self._pruned_homes:
             self._pruned_homes.add(str(directory))
-            cutoff = time.time() - TOOL_OUTPUT_MAX_AGE_DAYS * 86400
+            cutoff = time.time() - load_settings().tool_output_max_age_days * 86400
             try:
                 for item in directory.iterdir():
                     if item.is_file() and item.stat().st_mtime < cutoff:

@@ -22,23 +22,26 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-# Доли, а не размеры: сам бюджет приходит снаружи и считается от окна модели.
+from .settings import DEFAULTS
+
+# Доли, а не размеры: сам бюджет приходит снаружи и считается от окна модели. Здесь — значения
+# по умолчанию; профиль переопределяет их в секции `aida:` своего конфига (settings.py).
 #
 # У переписки и у инструментов отдельные бюджеты. Замер по двум разговорам с оператором
 # (state.db, 107 обменов): обмен «реплика — ответ» без инструментов в среднем 1,6 тыс. знаков,
 # десять подряд — не больше 24,7 тыс.; выхлоп инструментов — 85% объёма хода. При бюджете
 # хвоста около 145 тыс. знаков (60 тыс. токенов минус системная часть и ядро) переписке
 # отведена четверть: последние десять обменов влезают с запасом в полтора раза.
-CONVERSATION_SHARE = 0.25
+CONVERSATION_SHARE = DEFAULTS.conversation_share
 # Какую долю бюджета после пересборки могут занимать выводы инструментов (результаты и
 # аргументы обращений); всё, что старше, заменяется заглушкой.
-KEEP_RESULTS_SHARE = 0.35
+KEEP_RESULTS_SHARE = DEFAULTS.keep_results_share
 # Сколько хвоста остаётся после пересборки — оба бюджета вместе. Пересборка ломает кеш,
 # поэтому должна быть редкой и крупной: до следующей хвост может вырасти на 40% бюджета.
 STEP_KEEP = CONVERSATION_SHARE + KEEP_RESULTS_SHARE
 # Сколько последних обменов с человеком остаются в окне дословно, сколько бы инструментов ни
 # гонялось. Текущий, ещё не отвеченный вопрос — один из них.
-PROTECTED_EXCHANGES = 10
+PROTECTED_EXCHANGES = DEFAULTS.protected_exchanges
 # Короче этого результат не трогается: заглушка сама занимает около ста знаков.
 AGE_MIN_CHARS = 500
 
@@ -281,13 +284,13 @@ def tail_size(tail: Iterable[dict]) -> int:
     return sum(message_size(message) for message in tail)
 
 
-def _aging_boundary(messages: list[dict], budget: int) -> int:
+def _aging_boundary(messages: list[dict], budget: int, keep_share: float = KEEP_RESULTS_SHARE) -> int:
     """До какого места результаты инструментов и найденное в памяти уходят из запроса.
 
     Идём с конца и оставляем целым свежее, пока оно занимает не больше своей доли бюджета.
     Самое свежее остаётся целым всегда — модель его ещё не читала.
     """
-    limit = budget * KEEP_RESULTS_SHARE
+    limit = budget * keep_share
     spent = 0
     seen = False
     for index in range(len(messages) - 1, -1, -1):
@@ -313,7 +316,8 @@ def protected_start(messages: list[dict], exchanges: int = PROTECTED_EXCHANGES) 
 
 
 def rebase(messages: list[dict], budget: int, previous: TailState | None = None, *, age: bool = True,
-           overflow: bool = False, protect: int = PROTECTED_EXCHANGES) -> TailState:
+           overflow: bool = False, protect: int = PROTECTED_EXCHANGES,
+           talk_share: float = CONVERSATION_SHARE, keep_share: float = KEEP_RESULTS_SHARE) -> TailState:
     """Пересмотреть всё разом: границу заглушек, начало хвоста и разрез внутри хода.
 
     Последние `protect` обменов с человеком остаются всегда: хвост не начинается позже них.
@@ -326,7 +330,7 @@ def rebase(messages: list[dict], budget: int, previous: TailState | None = None,
     """
     if not messages:
         return TailState()
-    aged = _aging_boundary(messages, budget) if age else 0
+    aged = _aging_boundary(messages, budget, keep_share) if age else 0
     users = [index for index, message in enumerate(messages) if is_real_user(message)]
 
     def plan(folded: int) -> tuple[list[int], list[int]]:
@@ -348,7 +352,7 @@ def rebase(messages: list[dict], budget: int, previous: TailState | None = None,
         return state(0)  # разговор без реплик человека резать не по чему — отдаём как есть
 
     sizes, suffix = plan(0)
-    target = budget * STEP_KEEP
+    target = budget * (talk_share + keep_share)
     # После паузы достаточно, чтобы хвост помещался. А если пересборку вызвало переполнение,
     # одних новых заглушек должно хватить с запасом — иначе через ход она случится снова, а
     # каждая пересборка стоит кеша.
@@ -379,7 +383,7 @@ def rebase(messages: list[dict], budget: int, previous: TailState | None = None,
     # её бюджета (сколько из защищённых обменов влезает), вопрос последнего хода и столько
     # свежих связок, сколько влезает в остаток.
     last = users[-1]
-    talk = budget * CONVERSATION_SHARE
+    talk = budget * talk_share
     head = next((index for index in users if index >= guard and suffix[index] - suffix[last + 1] <= talk), last)
     return _long_turn_cut(messages, users, sizes, suffix, head, target,
                           lambda h, r=0: state(h, r, folded))
@@ -401,7 +405,8 @@ def _long_turn_cut(messages, users, sizes, suffix, head, target, state) -> TailS
 
 def select_tail(messages: list[dict], budget: int, state: TailState | None = None, *,
                 force: bool = False, paths: dict | None = None,
-                protect: int = PROTECTED_EXCHANGES) -> tuple[list[dict], TailState, bool]:
+                protect: int = PROTECTED_EXCHANGES, talk_share: float = CONVERSATION_SHARE,
+                keep_share: float = KEEP_RESULTS_SHARE) -> tuple[list[dict], TailState, bool]:
     """Хвост разговора для этого запроса. Возвращает хвост, решения и признак пересборки.
 
     Пока запомненные решения годятся и хвост помещается, он тот же, что в прошлый раз, плюс то,
@@ -413,7 +418,8 @@ def select_tail(messages: list[dict], budget: int, state: TailState | None = Non
         overflow = tail_size(tail) > budget
         if not overflow and not force:
             return tail, state, False
-    fresh = rebase(messages, budget, state, overflow=overflow, protect=protect)
+    fresh = rebase(messages, budget, state, overflow=overflow, protect=protect,
+                   talk_share=talk_share, keep_share=keep_share)
     return apply_state(messages, fresh, paths), fresh, True
 
 
