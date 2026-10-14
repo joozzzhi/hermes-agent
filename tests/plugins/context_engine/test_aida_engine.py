@@ -373,7 +373,8 @@ def _aging_request(turns: int) -> list[dict]:
 def test_the_read_dedup_is_reset_when_results_have_been_released(monkeypatch):
     # Модель, которой понадобился отпущенный результат, перечитает файл — и должна получить
     # содержимое, а не «файл не менялся».
-    monkeypatch.setenv("AIDA_CONTEXT_TOKENS", "10000")
+    # Бюджет задан в знаках (≈ 30k): 2 хода по ~4k помещаются, 12 — нет, при любом стартовом курсе.
+    monkeypatch.setenv("AIDA_CONTEXT_TOKENS", str(int(30_000 / engine_module.DEFAULT_CHARS_PER_TOKEN)))
     resets = []
     monkeypatch.setattr(AidaContextEngine, "_reset_read_dedup", staticmethod(lambda: resets.append(1)))
     eng = _engine(_Store())
