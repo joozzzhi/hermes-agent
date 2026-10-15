@@ -3,6 +3,10 @@
 ``{PLATFORM}_ALLOW_BOTS`` only decides admission, so two Hermes profiles replying to each other never stop.
 The guard counts admitted bot messages per conversation and drops further ones for ``cooldown_seconds``
 once ``max_events`` land inside ``window_seconds``. Settings: config.yaml ``gateway.bot_loop_guard``.
+
+``max_chain`` (0 = off) caps consecutive bot-to-bot hand-offs in one chat across ALL profiles of the process:
+distinct bot messages since the last human message (or since ``chain_reset_seconds`` of bot silence).
+The message past the cap is dropped, so a human has to speak before bots continue.
 """
 
 from __future__ import annotations
@@ -25,6 +29,8 @@ class BotLoopGuardSettings:
     max_events: int = 20
     window_seconds: float = 300.0
     cooldown_seconds: float = 600.0
+    max_chain: int = 0
+    chain_reset_seconds: float = 900.0
 
 
 def _as_bool(raw, default: bool) -> bool:
@@ -53,6 +59,16 @@ def _as_positive_int(raw, default: int) -> int:
     return int(value) if value >= 1 and value == int(value) else default
 
 
+def _as_non_negative_int(raw, default: int) -> int:
+    if raw is None or isinstance(raw, bool):
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return int(value) if value >= 0 and value == int(value) else default
+
+
 def settings_from_config(cfg) -> BotLoopGuardSettings:
     """Read ``gateway.bot_loop_guard`` from a loaded config dict. Unusable values keep the default."""
     from hermes_cli.config import cfg_get
@@ -66,6 +82,8 @@ def settings_from_config(cfg) -> BotLoopGuardSettings:
         max_events=_as_positive_int(block.get("max_events"), defaults.max_events),
         window_seconds=_as_positive(block.get("window_seconds"), defaults.window_seconds),
         cooldown_seconds=_as_positive(block.get("cooldown_seconds"), defaults.cooldown_seconds),
+        max_chain=_as_non_negative_int(block.get("max_chain"), defaults.max_chain),
+        chain_reset_seconds=_as_positive(block.get("chain_reset_seconds"), defaults.chain_reset_seconds),
     )
 
 
@@ -93,6 +111,8 @@ class BotLoopGuard:
         self._lock = threading.Lock()
         self._events: Dict[Hashable, Deque[float]] = {}
         self._cooldown_until: Dict[Hashable, float] = {}
+        # chat -> (message ids of the current bot chain, time of the last bot message)
+        self._chains: Dict[Hashable, Tuple[set, float]] = {}
         self._last_sweep = 0.0
 
     @property
@@ -129,6 +149,31 @@ class BotLoopGuard:
             events.append(now)
             return True, "ok"
 
+    def chain(self, chat: Hashable, message_id, is_bot: bool) -> Tuple[bool, int]:
+        """Track the bot-to-bot hand-off chain of ``chat``. A human message resets it.
+        Returns ``(allowed, length)``; a bot message past ``max_chain`` is refused. Re-delivery of
+        the same message id (several profiles, busy path + drain) counts once."""
+        settings = self._settings()
+        if not settings.enabled or settings.max_chain <= 0:
+            return True, 0
+        now = self._clock()
+        with self._lock:
+            if not is_bot:
+                self._chains.pop(chat, None)
+                return True, 0
+            ids, last = self._chains.get(chat, (set(), now))
+            if now - last > settings.chain_reset_seconds:
+                ids = set()
+            key = str(message_id) if message_id not in (None, "") else f"anon:{now}:{len(ids)}"
+            if key in ids:
+                self._chains[chat] = (ids, now)
+                return True, len(ids)
+            if len(ids) >= settings.max_chain:
+                return False, len(ids) + 1
+            ids.add(key)
+            self._chains[chat] = (ids, now)
+            return True, len(ids)
+
     def _sweep(self, now: float, settings: BotLoopGuardSettings) -> None:
         """Drop idle conversations at most once per window so memory stays bounded."""
         if now - self._last_sweep < settings.window_seconds:
@@ -139,3 +184,5 @@ class BotLoopGuard:
             del self._events[key]
         for key in [k for k, until in self._cooldown_until.items() if until <= now]:
             del self._cooldown_until[key]
+        for key in [k for k, (_ids, last) in self._chains.items() if now - last > settings.chain_reset_seconds]:
+            del self._chains[key]

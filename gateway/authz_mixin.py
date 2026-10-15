@@ -600,11 +600,23 @@ class GatewayAuthorizationMixin:
         return (self._adapter_profile_for_source(source) or "", platform, str(source.chat_id or ""))
 
     def _admit_bot_message(self, source: SessionSource) -> bool:
-        """Count one authorized bot-authored inbound message. False when it trips the budget or the chat is cooling down.
+        """Count one authorized bot-authored inbound message. False when it trips the budget or the chat is cooling down,
+        or when it is one bot-to-bot hand-off too many (``max_chain``; a human message resets the chain).
         The inbound handler calls this once per message; ``_is_user_authorized`` only peeks because it is asked several times."""
-        if not getattr(source, "is_bot", False):
+        guard = self._bot_loop_guard_instance()
+        is_bot = bool(getattr(source, "is_bot", False))
+        platform = source.platform.value if source.platform else ""
+        chain_ok, chain_len = guard.chain((platform, str(source.chat_id or "")), getattr(source, "message_id", None), is_bot)
+        if not is_bot:
             return True
-        allowed, state = self._bot_loop_guard_instance().admit(self._bot_loop_guard_conversation(source))
+        if not chain_ok:
+            logger.warning(
+                "Bot chain limit: dropping bot message %s from %s in %s chat %s (hand-off #%d in a row without a human; "
+                "gateway.bot_loop_guard.max_chain in config.yaml).",
+                getattr(source, "message_id", None), source.user_id, platform, source.chat_id, chain_len,
+            )
+            return False
+        allowed, state = guard.admit(self._bot_loop_guard_conversation(source))
         if state == "tripped":
             logger.warning(
                 "Bot loop guard is dropping bot messages in %s chat %s: bot %s sent one message too many "
