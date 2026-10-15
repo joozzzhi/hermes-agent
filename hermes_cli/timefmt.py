@@ -19,10 +19,25 @@ EPOCH_MIN = 0.0
 EPOCH_MAX = 4_200_000_000.0
 
 
+def _iso_epoch(value: Any) -> float:
+    """ISO-8601 string -> epoch seconds, ``nan`` otherwise.
+
+    Gateway adapters stamp observed/mirrored messages with ``datetime.isoformat()`` (e.g. the
+    Telegram group observer); that is a valid time, not corruption, and must not log a WARNING on
+    every message. Naive strings are local time, matching ``datetime.now().isoformat()``.
+    """
+    if not isinstance(value, str):
+        return math.nan
+    try:
+        return float(datetime.fromisoformat(value.strip().replace("Z", "+00:00")).timestamp())
+    except (ValueError, OverflowError, OSError):
+        return math.nan
+
+
 def coerce_epoch(value: Any, *, session_id: Optional[str] = None, field: str = "timestamp") -> Optional[float]:
     """A stored timestamp cell as float epoch seconds, or ``None`` when it cannot be trusted.
 
-    Numbers, numeric strings and ``datetime`` are accepted; anything else, non-finite values and
+    Numbers, numeric strings, ISO-8601 strings and ``datetime`` are accepted; anything else, non-finite values and
     values outside ``EPOCH_MIN..EPOCH_MAX`` return ``None`` after a WARNING naming the session so
     the corrupt row can be found. ``None``/``""`` mean "unset" and stay silent. Every reader that
     renders a row timestamp goes through here (a bad row degrades to one ``?`` cell, never a dead
@@ -33,7 +48,7 @@ def coerce_epoch(value: Any, *, session_id: Optional[str] = None, field: str = "
     try:
         ts = float(value.timestamp()) if isinstance(value, datetime) else float(value)
     except (TypeError, ValueError):
-        ts = math.nan
+        ts = _iso_epoch(value)
     if not (EPOCH_MIN <= ts <= EPOCH_MAX):  # also False for nan
         logger.warning("Ignoring corrupt %s %r%s", field, value, f" on session {session_id}" if session_id else "")
         return None
