@@ -79,6 +79,26 @@ def test_collect_dedupes_merges_and_skips(tmp_path):
     assert not any("свежий" in e.content for e in entries)
 
 
+def test_parse_incoming_strips_timestamp_and_reasoning():
+    name, uid, reply_to, text = gl.parse_incoming(
+        '[Wed 2026-10-14 18:47:27 MSK] [Replying to: "q"]\n\n[Karma|900]\nтемы не делаем')
+    assert (name, uid, reply_to, text) == ("Karma", "900", "q", "темы не делаем")
+    name, _, _, text = gl.parse_incoming("[Wed 2026-09-23 17:37:33 Саратов (зима)] [Hrmbi|8]\nзадача")
+    assert name == "Hrmbi" and text == "задача"
+    _, _, _, text = gl.parse_incoming("[devbi|7]\n💭 Reasoning:\nдумаю\n\n\nПринял.")
+    assert text == "Принял."
+
+
+def test_collect_skips_compaction_and_process_notes(tmp_path):
+    home = tmp_path / "hermes"
+    _db(home / "state.db", [
+        ("s1", "assistant", "[PRIOR CONTEXT — for reference only]\n\n[CONTEXT COMPACTION] сводка", None, NOW - 3600),
+        ("s1", "user", "[IMPORTANT: Background process proc_1 exited (exit code 3).", "20", NOW - 3600),
+        ("s1", "user", "[Karma|900]\nживое", "21", NOW - 3600),
+    ])
+    assert [e.content for e in gl.collect(home, now=NOW)] == ["живое"]
+
+
 def test_collect_since_window(tmp_path):
     home = _home(tmp_path)
     ids = {e.msg_id for e in gl.collect(home, since=NOW - 1000, now=NOW)}

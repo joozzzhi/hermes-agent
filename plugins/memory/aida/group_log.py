@@ -49,7 +49,10 @@ CURRENT_HEADER = "[Current addressed message - answer only this unless it explic
 BLOCK_SPLIT = re.compile(r'\n\n(?=\[Replying to: "|\[[^\]\n|]+\|\d+\]\n)')
 REASONING = re.compile(r"💭 Reasoning:\n.*?\n\n\n", re.S)
 # Gateway status noise — not part of the conversation.
-NOISE = re.compile(r"^(⏳ Working|💾 Self-improvement review|📬 No home channel|🧠 Память — recalled)")
+NOISE = re.compile(r"^(⏳ Working|💾 Self-improvement review|📬 No home channel|🧠 Память — recalled"
+                   r"|\[IMPORTANT: Background process|\[PRIOR CONTEXT|\[CONTEXT COMPACTION)")
+# Gateway-added send-time stamp, e.g. "[Wed 2026-10-14 18:47:27 MSK] " — ts lives in its own column.
+TS_PREFIX = re.compile(r"^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{4}-\d\d-\d\d \d\d:\d\d(?::\d\d)?[^\]\n]*\]\s*")
 
 DDL = """
 CREATE TABLE IF NOT EXISTS group_log (
@@ -173,16 +176,17 @@ def strip_observed(text: str) -> str:
 
 def parse_incoming(content: str) -> tuple[str | None, str | None, str | None, str]:
     """-> (author_name, author_id, reply_to, text) of an inbound group row."""
-    text = strip_observed(content or "")
+    text = TS_PREFIX.sub("", strip_observed(TS_PREFIX.sub("", content or "", count=1)), count=1)
     reply_to = None
     m = REPLY_QUOTE.match(text)
     if m:
         reply_to, text = m.group(1), text[m.end():]
     text = SYSTEM_NOTE.sub("", text, count=1)
+    text = TS_PREFIX.sub("", text, count=1)
     m = ROLE_HEADER.match(text)
     if not m:
-        return None, None, reply_to, text.strip()
-    return m.group(1).strip(), m.group(2), reply_to, text[m.end():].strip()
+        return None, None, reply_to, clean_reply(text)
+    return m.group(1).strip(), m.group(2), reply_to, clean_reply(text[m.end():])
 
 
 def clean_reply(content: str) -> str:
