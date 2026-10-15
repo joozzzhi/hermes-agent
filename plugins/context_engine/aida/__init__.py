@@ -46,6 +46,7 @@ from .assembly import (
     apply_state,
     breakdown,
     build_knowledge_block,
+    build_research_index,
     count_aged,
     is_conversation_message,
     merge_into_system,
@@ -120,6 +121,7 @@ class _Conversation:
 
     tail: TailState | None = None
     knowledge: str | None = None  # None — ядро ещё не удалось прочитать
+    research: str | None = None   # оглавление исследований; None — ещё не собрано
     last_seen: float = 0.0
     aged: int = 0
     paths: dict = field(default_factory=dict)   # tool_call_id → полный вывод на диске
@@ -286,7 +288,9 @@ class AidaContextEngine(ContextEngine):
             fresh = self._load_knowledge(int(budget * settings.knowledge_share), settings.core_types)
             if fresh is not None:
                 state.knowledge = fresh
-        knowledge = state.knowledge or ""
+        if state.research is None or cold:
+            state.research = self._load_research(int(budget * settings.knowledge_share), settings.research_dir)
+        knowledge = "\n\n".join(part for part in (state.knowledge, state.research) if part)
 
         system_size = sum(message_size(m) for m in system_head)
         head_size = system_size + len(knowledge)
@@ -423,6 +427,25 @@ class AidaContextEngine(ContextEngine):
         if types:
             rows = [row for row in rows if (row.get("memory_type") or "") in types]
         return build_knowledge_block(rows, budget)
+
+    @staticmethod
+    def _load_research(budget: int, folder: str) -> str:
+        """Оглавление исследований (`aida.research_dir`): имя, заголовок, первая строка вывода.
+        Относительный путь — от корня Гермеса, общего для всех профилей. Ошибка — без оглавления."""
+        if not folder:
+            return ""
+        try:
+            from pathlib import Path
+
+            path = Path(folder)
+            if not path.is_absolute():
+                from hermes_constants import get_default_hermes_root
+
+                path = get_default_hermes_root() / path
+            return build_research_index(path, budget)
+        except Exception:
+            logger.warning("Витрина: оглавление исследований не собрано", exc_info=True)
+            return ""
 
     def _get_store(self) -> Any:
         """Та же база, что у памяти Гермеса. Не получилось — пробуем снова через минуту, а не

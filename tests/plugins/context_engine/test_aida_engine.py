@@ -650,3 +650,63 @@ def test_name_lists_are_read_from_yaml_lists_and_comma_strings(tmp_path):
     assert s.exclude_tools == ("memory", "todo")
     assert s.core_types == ("rule",)
     assert s.keep_last_tool_results == 5
+
+
+# -- оглавление исследований (сёрч): aida.research_dir ------------------------------------------
+
+def _research(tmp_path):
+    folder = tmp_path / "research"
+    folder.mkdir(parents=True)
+    (folder / "rpg.md").write_text("# RPG-системы прогрессии\n\nДата.\n\n## 1. Вывод (уверенность)\n\n"
+                                   "1. **Механики описаны надёжно.** Уверенность высокая.\n- ещё\n",
+                                   encoding="utf-8")
+    (folder / "metrics.md").write_text("# Профиль контекста\n\n## 4. Длина вывода инструментов\n- медиана 1233\n\n## Выводы\n- В coder ~93% — инструменты.\n",
+                                       encoding="utf-8")
+    (folder / "_task-rpg.txt").write_text("задание", encoding="utf-8")
+    (folder / "_run-rpg.md").write_text("# служебное", encoding="utf-8")
+    return folder
+
+
+def test_the_research_index_lists_name_title_and_first_conclusion_line(tmp_path):
+    from plugins.context_engine.aida.assembly import build_research_index
+
+    text = build_research_index(_research(tmp_path), 10_000)
+    assert "- metrics.md — Профиль контекста. Вывод: В coder ~93% — инструменты." in text
+    assert "- rpg.md — RPG-системы прогрессии. Вывод: Механики описаны надёжно. Уверенность высокая." in text
+    assert "_run-rpg" not in text and "_task" not in text and "ещё" not in text
+    assert build_research_index(tmp_path / "нет", 10_000) == ""
+    # Не влезает строка — её нет, но и ядро не рвётся посередине строки.
+    small = build_research_index(_research(tmp_path / "s"), 140)
+    assert "rpg.md" not in small
+
+
+def test_a_profile_with_research_dir_gets_the_index_in_the_system_part(tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    folder = _research(tmp_path)
+    home = tmp_path / "serch"
+    home.mkdir()
+    (home / "config.yaml").write_text(f"aida:\n  research_dir: '{folder.as_posix()}'\n", encoding="utf-8")
+    token = set_hermes_home_override(home)
+    try:
+        text = _system_text(_engine(_Store(core=_core("правило"))).select_context(_request()))
+    finally:
+        reset_hermes_home_override(token)
+    assert "правило" in text and "rpg.md — RPG-системы прогрессии" in text
+    # Без настройки — оглавления нет, как раньше.
+    assert "rpg.md" not in _system_text(_engine(_Store(core=_core("правило"))).select_context(_request()))
+
+
+def test_the_index_stands_even_without_the_shared_memory(tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    folder = _research(tmp_path)
+    home = tmp_path / "serch"
+    home.mkdir()
+    (home / "config.yaml").write_text(f"aida:\n  research_dir: '{folder.as_posix()}'\n", encoding="utf-8")
+    token = set_hermes_home_override(home)
+    try:
+        text = _system_text(_engine_without_memory().select_context(_request()))
+    finally:
+        reset_hermes_home_override(token)
+    assert "metrics.md" in text

@@ -481,6 +481,66 @@ def build_knowledge_block(rows: Iterable[dict], budget: int) -> str:
     return "\n".join(lines)
 
 
+RESEARCH_LABEL = "Исследования (оглавление; файл читать по требованию, прежде чем исследовать заново)"
+_RESEARCH_LINE_CAP = 300
+
+
+def _plain(text: str) -> str:
+    text = re.sub(r"[*_`]+", "", text)
+    text = re.sub(r"^\s*(?:[-*]|\d+[.)])\s+", "", text)
+    return " ".join(text.split())
+
+
+def research_entry(name: str, text: str) -> str:
+    """Одна строка оглавления: имя файла, заголовок и первая содержательная строка вывода."""
+    lines = text.splitlines()
+    title = ""
+    for line in lines:
+        if line.startswith("# "):
+            title = _plain(line[2:])
+            break
+    conclusion = ""
+    in_conclusion = False
+    for line in lines:
+        if re.match(r"^#{2,}\s", line):
+            in_conclusion = re.search(r"вывод(?:ы)?(?![а-яё])", line.lower()) is not None
+            continue
+        if in_conclusion and line.strip():
+            conclusion = _plain(line)
+            break
+    entry = name + (f" — {title}" if title else "") + (f". Вывод: {conclusion}" if conclusion else "")
+    if len(entry) > _RESEARCH_LINE_CAP:
+        entry = entry[: _RESEARCH_LINE_CAP - 1].rstrip() + "…"
+    return entry
+
+
+def build_research_index(folder, budget: int) -> str:
+    """Оглавление папки исследований для ядра. Служебные файлы (`_run-…`, `_task-…`) и не-md
+    пропускаются; строки берутся по алфавиту, пока влезают в `budget`. Папки нет — пусто."""
+    from pathlib import Path
+
+    root = Path(folder)
+    if not root.is_dir():
+        return ""
+    lines = [f"## {RESEARCH_LABEL}", f"Папка: {root}"]
+    spent = sum(len(line) + 1 for line in lines)
+    added = 0
+    for path in sorted(root.glob("*.md")):
+        if path.name.startswith("_"):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        entry = "- " + research_entry(path.name, text)
+        if spent + len(entry) + 1 > budget:
+            continue
+        spent += len(entry) + 1
+        lines.append(entry)
+        added += 1
+    return "\n".join(lines) if added else ""
+
+
 def merge_into_system(system_head: list[dict], block: str) -> list[dict]:
     """Влить блок в системную часть хозяина, а НЕ добавить вторым системным сообщением.
 

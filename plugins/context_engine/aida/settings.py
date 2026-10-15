@@ -49,6 +49,10 @@ class AidaSettings:
     exclude_tools: tuple = ()
     # Какие типы записей ядра видит профиль (rule, decision, project, lesson…); пусто — все.
     core_types: tuple = ()
+    # Папка исследований (например `research` — от корня Гермеса, или абсолютный путь). Задана —
+    # в ядро встаёт оглавление: имя файла, заголовок и первая строка вывода; сами файлы агент читает
+    # по требованию. Пусто — оглавления нет.
+    research_dir: str = ""
 
     @property
     def step_keep(self) -> float:
@@ -107,6 +111,9 @@ def load_settings() -> AidaSettings:
                 logger.warning("Витрина: aida.%s = %r — нужен список имён, беру %s", item.name, raw, default)
                 continue
             values[item.name] = names
+            continue
+        if isinstance(default, str):
+            values[item.name] = str(raw).strip()
             continue
         try:
             value = type(default)(float(raw)) if isinstance(default, int) else float(raw)
