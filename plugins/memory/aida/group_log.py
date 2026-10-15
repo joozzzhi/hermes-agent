@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -80,6 +81,12 @@ ON CONFLICT (chat_id, msg_id) DO UPDATE SET
     seen_by = ARRAY(SELECT DISTINCT unnest(group_log.seen_by || EXCLUDED.seen_by) ORDER BY 1),
     content = EXCLUDED.content,
     reply_to = EXCLUDED.reply_to
+"""
+
+PURGE = """
+DELETE FROM group_log
+WHERE content LIKE '[PRIOR CONTEXT%%' OR content LIKE '[CONTEXT COMPACTION%%'
+   OR content LIKE '[IMPORTANT: Background process%%'
 """
 
 
@@ -286,42 +293,59 @@ def connect(url: str):
                            options="-c statement_timeout=30000")
 
 
-def push(entries: list[Entry], url: str) -> int:
+def push(entries: list[Entry], url: str, *, full: bool = False) -> int:
+    """``full``: entries are the whole history, so own-reply rows not produced any more (their
+    text changed under a newer cleaner, or another bot's observation now covers them) are dropped."""
     with connect(url) as con:
         con.execute(DDL)
+        con.execute(PURGE)  # rows written before a noise filter existed; rebuildable from state.db
+        if full:
+            keep = [e.msg_id for e in entries if e.msg_id.startswith("self:")]
+            con.execute("DELETE FROM group_log WHERE msg_id LIKE 'self:%%' AND NOT msg_id = ANY(%s)", (keep,))
         with con.cursor() as cur:
             cur.executemany(UPSERT, [e.row() for e in entries])
     return len(entries)
 
 
+# Question filler: "что решили про X" must rank by X, not by who happened to write "решили".
+FILLER = frozenset("""что как про чем чём где когда кто зачем почему ли это там тут было были был
+решили решил решила решение решения договорились сказал сказали говорили обсуждали обсудили
+насчёт насчет итог итоги какой какие какая""".split())
+
+
+def query_words(query: str) -> list[str]:
+    words = [w for w in re.findall(r"\w{3,}", query.lower())]
+    topic = [w for w in words if w not in FILLER]
+    return topic or words
+
+
 def search_remote(query: str, url: str, limit: int = 10) -> list[tuple]:
+    # rank normalisation 1 = divide by 1+log(length): a 15k-char dump must not beat a one-liner.
     sql = """
     SELECT ts, author_name, content,
-           ts_rank(search_ru, websearch_to_tsquery('russian', %(q)s)) AS r
+           ts_rank(search_ru, to_tsquery('russian', %(any)s), 1) AS r
     FROM group_log
-    WHERE search_ru @@ websearch_to_tsquery('russian', %(q)s)
-       OR search_ru @@ to_tsquery('russian', %(any)s)
-    ORDER BY (search_ru @@ websearch_to_tsquery('russian', %(q)s)) DESC, r DESC, ts DESC
+    WHERE search_ru @@ to_tsquery('russian', %(any)s)
+    ORDER BY (search_ru @@ to_tsquery('russian', %(all)s)) DESC, r DESC, ts DESC
     LIMIT %(n)s
     """
-    words = [w for w in re.findall(r"\w{3,}", query.lower())]
-    anyq = " | ".join(words) or "x"
+    words = query_words(query) or ["x"]
     with connect(url) as con:
         return [(r[0].timestamp(), r[1], r[2]) for r in
-                con.execute(sql, {"q": query, "any": anyq, "n": limit}).fetchall()]
+                con.execute(sql, {"any": " | ".join(words), "all": " & ".join(words),
+                                  "n": limit}).fetchall()]
 
 
 def search_local(query: str, home: Path, limit: int = 10) -> list[tuple]:
-    words = [w.lower() for w in re.findall(r"\w{3,}", query)]
-    stems = [w[:max(3, len(w) - 2)] for w in words]
+    stems = [w[:max(3, len(w) - 2)] for w in query_words(query)]
     scored = []
     for e in collect(home, now=time.time() + SELF_GRACE_S):
         low = e.content.lower()
         hits = sum(1 for s in stems if s in low)
         if hits:
-            scored.append((hits, e.ts, e))
-    scored.sort(key=lambda t: (-t[0], -t[1]))
-    return [(e.ts, e.author_name, e.content) for _, _, e in scored[:limit]]
+            scored.append((hits == len(stems), hits / (1 + math.log10(1 + len(low))), e.ts, e))
+    scored.sort(key=lambda t: (not t[0], -t[1], -t[2]))
+    return [(e.ts, e.author_name, e.content) for *_, e in scored[:limit]]
 
 
 def _fmt(rows: list[tuple], width: int) -> str:
@@ -359,7 +383,7 @@ def main(argv: list[str] | None = None) -> int:
         if not url:
             print("SUPABASE_DB_URL not set", file=sys.stderr)
             return 2
-        n = push(entries, url)
+        n = push(entries, url, full=a.days <= 0)
         print(f"group_log: upserted {n}")
         return 0
     url = "" if a.local else db_url(home)

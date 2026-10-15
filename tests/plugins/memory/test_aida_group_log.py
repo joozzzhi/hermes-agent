@@ -99,6 +99,17 @@ def test_collect_skips_compaction_and_process_notes(tmp_path):
     assert [e.content for e in gl.collect(home, now=NOW)] == ["живое"]
 
 
+def test_search_ranks_by_topic_not_filler(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    _db(home / "state.db", [
+        ("s1", "user", "[Joe|700]\nмы решили что-то другое, решили и решили " + "слово " * 400, "30", NOW - 100),
+        ("s1", "user", "[Karma|900]\nтемы группы не делаем", "31", NOW - 5000),
+    ])
+    monkeypatch.setattr(gl.time, "time", lambda: NOW)
+    assert gl.query_words("что решили про темы группы") == ["темы", "группы"]
+    assert gl.search_local("что решили про темы группы", home, limit=1)[0][2] == "темы группы не делаем"
+
+
 def test_collect_since_window(tmp_path):
     home = _home(tmp_path)
     ids = {e.msg_id for e in gl.collect(home, since=NOW - 1000, now=NOW)}
