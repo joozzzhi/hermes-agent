@@ -1,0 +1,6 @@
+name: group-log
+version: 1.0.0
+description: "Shared journal of the Telegram group (Supabase table group_log, synced from every profile's state.db by the Hermes_GroupLog task). Tool group_log_search answers 'what did we decide about X' after a session reset."
+author: robji
+provides_tools:
+  - group_log_search
