@@ -161,9 +161,15 @@ def _recalled_size(message: dict) -> int:
     return sum(len(match.group(0)) for match in _RECALLED.finditer(content))
 
 
-def _ageable(message: dict) -> bool:
+def _tool_name(message: dict) -> str:
+    return str(message.get("name") or message.get("tool_name") or "")
+
+
+def _ageable(message: dict, exclude: Iterable[str] = ()) -> bool:
     content = message.get("content")
     if message.get("role") == "tool":
+        if exclude and _tool_name(message) in exclude:
+            return False  # профиль просил этот вывод не отпускать никогда (например, план todo)
         return isinstance(content, str) and len(content) > AGE_MIN_CHARS
     if message.get("role") == "assistant":
         return any(len(_call_arguments(call)) > AGE_MIN_CHARS for call in message.get("tool_calls") or ())
@@ -178,7 +184,8 @@ def _aged(message: dict, paths: dict | None = None) -> dict:
     return {**message, "content": _RECALLED.sub("", message["content"]).strip() or message["content"]}
 
 
-def age_before(messages: list[dict], boundary: int, paths: dict | None = None) -> list[dict]:
+def age_before(messages: list[dict], boundary: int, paths: dict | None = None,
+               exclude: Iterable[str] = ()) -> list[dict]:
     """Состарить то, что стоит до границы: длинные результаты и аргументы обращений заменить
     заглушкой, а с давних вопросов снять найденное под них в памяти. Вход не меняется.
 
@@ -188,17 +195,17 @@ def age_before(messages: list[dict], boundary: int, paths: dict | None = None) -
         return messages
     out = list(messages)
     for index in range(min(boundary, len(messages))):
-        if _ageable(messages[index]):
+        if _ageable(messages[index], exclude):
             out[index] = _aged(messages[index], paths)
     return out
 
 
-def count_aged(messages: list[dict], boundary: int) -> int:
-    return sum(1 for index in range(min(max(boundary, 0), len(messages))) if _ageable(messages[index]))
+def count_aged(messages: list[dict], boundary: int, exclude: Iterable[str] = ()) -> int:
+    return sum(1 for index in range(min(max(boundary, 0), len(messages))) if _ageable(messages[index], exclude))
 
 
-def _aged_size(message: dict, aged: bool) -> int:
-    return message_size(_aged(message)) if aged and _ageable(message) else message_size(message)
+def _aged_size(message: dict, aged: bool, exclude: Iterable[str] = ()) -> int:
+    return message_size(_aged(message)) if aged and _ageable(message, exclude) else message_size(message)
 
 
 def _has_text(message: dict) -> bool:
@@ -268,9 +275,10 @@ class TailState:
         return not self.folded or same(self.folded - 1, self.folded_key)
 
 
-def apply_state(messages: list[dict], state: TailState, paths: dict | None = None) -> list[dict]:
+def apply_state(messages: list[dict], state: TailState, paths: dict | None = None,
+                exclude: Iterable[str] = ()) -> list[dict]:
     """Хвост по запомненным решениям. Одни и те же решения дают одни и те же байты."""
-    aged = age_before(messages, state.aged, paths)
+    aged = age_before(messages, state.aged, paths, exclude)
     picked: Iterable[int] = range(state.head, len(messages))
     if state.resume > state.head:
         # Разрез внутри последнего хода: его вопрос остаётся, середина до resume выбрасывается.
@@ -284,22 +292,27 @@ def tail_size(tail: Iterable[dict]) -> int:
     return sum(message_size(message) for message in tail)
 
 
-def _aging_boundary(messages: list[dict], budget: int, keep_share: float = KEEP_RESULTS_SHARE) -> int:
+def _aging_boundary(messages: list[dict], budget: int, keep_share: float = KEEP_RESULTS_SHARE,
+                    keep_last: int = 0, exclude: Iterable[str] = ()) -> int:
     """До какого места результаты инструментов и найденное в памяти уходят из запроса.
 
     Идём с конца и оставляем целым свежее, пока оно занимает не больше своей доли бюджета.
-    Самое свежее остаётся целым всегда — модель его ещё не читала.
+    Самое свежее остаётся целым всегда — модель его ещё не читала; `keep_last` последних
+    результатов инструментов — тоже, даже если доля уже кончилась.
     """
     limit = budget * keep_share
     spent = 0
     seen = False
+    kept_results = 0
     for index in range(len(messages) - 1, -1, -1):
-        if not _ageable(messages[index]):
+        if not _ageable(messages[index], exclude):
             continue
         spent += tool_part_size(messages[index])
-        if spent > limit and seen:
+        if spent > limit and seen and kept_results >= keep_last:
             return index + 1
         seen = True
+        if messages[index].get("role") == "tool":
+            kept_results += 1
     return 0
 
 
@@ -317,7 +330,8 @@ def protected_start(messages: list[dict], exchanges: int = PROTECTED_EXCHANGES) 
 
 def rebase(messages: list[dict], budget: int, previous: TailState | None = None, *, age: bool = True,
            overflow: bool = False, protect: int = PROTECTED_EXCHANGES,
-           talk_share: float = CONVERSATION_SHARE, keep_share: float = KEEP_RESULTS_SHARE) -> TailState:
+           talk_share: float = CONVERSATION_SHARE, keep_share: float = KEEP_RESULTS_SHARE,
+           keep_last: int = 0, exclude: Iterable[str] = ()) -> TailState:
     """Пересмотреть всё разом: границу заглушек, начало хвоста и разрез внутри хода.
 
     Последние `protect` обменов с человеком остаются всегда: хвост не начинается позже них.
@@ -330,12 +344,12 @@ def rebase(messages: list[dict], budget: int, previous: TailState | None = None,
     """
     if not messages:
         return TailState()
-    aged = _aging_boundary(messages, budget, keep_share) if age else 0
+    aged = _aging_boundary(messages, budget, keep_share, keep_last, exclude) if age else 0
     users = [index for index, message in enumerate(messages) if is_real_user(message)]
 
     def plan(folded: int) -> tuple[list[int], list[int]]:
         dropped = folded_indices(messages, folded)
-        sizes = [0 if index in dropped else _aged_size(message, index < aged)
+        sizes = [0 if index in dropped else _aged_size(message, index < aged, exclude)
                  for index, message in enumerate(messages)]
         suffix = [0] * (len(messages) + 1)
         for index in range(len(messages) - 1, -1, -1):
@@ -406,7 +420,8 @@ def _long_turn_cut(messages, users, sizes, suffix, head, target, state) -> TailS
 def select_tail(messages: list[dict], budget: int, state: TailState | None = None, *,
                 force: bool = False, paths: dict | None = None,
                 protect: int = PROTECTED_EXCHANGES, talk_share: float = CONVERSATION_SHARE,
-                keep_share: float = KEEP_RESULTS_SHARE) -> tuple[list[dict], TailState, bool]:
+                keep_share: float = KEEP_RESULTS_SHARE, keep_last: int = 0,
+                exclude: Iterable[str] = ()) -> tuple[list[dict], TailState, bool]:
     """Хвост разговора для этого запроса. Возвращает хвост, решения и признак пересборки.
 
     Пока запомненные решения годятся и хвост помещается, он тот же, что в прошлый раз, плюс то,
@@ -414,13 +429,13 @@ def select_tail(messages: list[dict], budget: int, state: TailState | None = Non
     """
     overflow = False
     if state is not None and state.fits(messages):
-        tail = apply_state(messages, state, paths)
+        tail = apply_state(messages, state, paths, exclude)
         overflow = tail_size(tail) > budget
         if not overflow and not force:
             return tail, state, False
     fresh = rebase(messages, budget, state, overflow=overflow, protect=protect,
-                   talk_share=talk_share, keep_share=keep_share)
-    return apply_state(messages, fresh, paths), fresh, True
+                   talk_share=talk_share, keep_share=keep_share, keep_last=keep_last, exclude=exclude)
+    return apply_state(messages, fresh, paths, exclude), fresh, True
 
 
 def breakdown(tail: Iterable[dict]) -> tuple[int, int, int]:

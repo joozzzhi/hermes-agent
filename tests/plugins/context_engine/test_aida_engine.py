@@ -572,3 +572,81 @@ def test_without_a_section_the_settings_are_the_defaults(tmp_path, monkeypatch):
             assert load_settings() == expected
         finally:
             reset_hermes_home_override(token)
+
+
+# -- настройки под роль (робжи): keep_last_tool_results, exclude_tools, core_types --------------
+
+def _tool_chain(sizes, names=None) -> list[dict]:
+    msgs = [{"role": "system", "content": "личность"}, {"role": "user", "content": "почини"}]
+    for i, size in enumerate(sizes):
+        name = (names or {}).get(i, "terminal")
+        msgs.append({"role": "assistant", "content": "", "tool_calls": [
+            {"id": f"c{i}", "type": "function", "function": {"name": name, "arguments": "{}"}}]})
+        msgs.append({"role": "tool", "name": name, "tool_call_id": f"c{i}", "content": chr(1072 + i % 30) * size})
+    msgs.append({"role": "assistant", "content": "готово"})
+    msgs.append({"role": "user", "content": "дальше"})
+    return msgs
+
+
+def _whole_results(out: list[dict]) -> list[str]:
+    return [m["tool_call_id"] for m in out
+            if m.get("role") == "tool" and "отпущен из запроса" not in str(m.get("content"))]
+
+
+def test_the_last_results_stay_whole_even_when_their_share_is_spent():
+    from plugins.context_engine.aida.assembly import rebase, apply_state
+
+    msgs = _tool_chain([3000] * 8)[1:]
+    by_share = apply_state(msgs, rebase(msgs, 20_000, keep_share=0.2))
+    guaranteed = apply_state(msgs, rebase(msgs, 20_000, keep_share=0.2, keep_last=5))
+    assert len(_whole_results(by_share)) < 5
+    assert _whole_results(guaranteed)[-5:] == [f"c{i}" for i in range(3, 8)]
+
+
+def test_an_excluded_tool_is_never_released():
+    from plugins.context_engine.aida.assembly import rebase, apply_state
+
+    msgs = _tool_chain([3000] * 8, names={0: "todo"})[1:]
+    plain = apply_state(msgs, rebase(msgs, 20_000, keep_share=0.2))
+    kept = apply_state(msgs, rebase(msgs, 20_000, keep_share=0.2, exclude=("todo",)), exclude=("todo",))
+    assert "c0" not in _whole_results(plain)
+    assert "c0" in _whole_results(kept)
+
+
+def test_a_profile_sees_only_its_kinds_of_core(tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    core = [{"content": "правило про ветки", "memory_type": "rule", "created_at": None},
+            {"content": "любимый сериал оператора", "memory_type": "preference", "created_at": None},
+            {"content": "решили не делать темы", "memory_type": "decision", "created_at": None}]
+    home = tmp_path / "coder"
+    home.mkdir()
+    (home / "config.yaml").write_text("aida:\n  core_types: [rule, decision, project, lesson]\n",
+                                      encoding="utf-8")
+    token = set_hermes_home_override(home)
+    try:
+        text = _system_text(_engine(_Store(core=core)).select_context(_request()))
+    finally:
+        reset_hermes_home_override(token)
+    assert "правило про ветки" in text and "решили не делать темы" in text
+    assert "сериал" not in text
+    # Без фильтра — всё ядро, как раньше.
+    assert "сериал" in _system_text(_engine(_Store(core=core)).select_context(_request()))
+
+
+def test_name_lists_are_read_from_yaml_lists_and_comma_strings(tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from plugins.context_engine.aida.settings import load_settings
+
+    home = tmp_path / "p"
+    home.mkdir()
+    (home / "config.yaml").write_text("aida:\n  exclude_tools: todo, memory\n  core_types: [rule]\n"
+                                      "  keep_last_tool_results: 5\n", encoding="utf-8")
+    token = set_hermes_home_override(home)
+    try:
+        s = load_settings()
+    finally:
+        reset_hermes_home_override(token)
+    assert s.exclude_tools == ("memory", "todo")
+    assert s.core_types == ("rule",)
+    assert s.keep_last_tool_results == 5

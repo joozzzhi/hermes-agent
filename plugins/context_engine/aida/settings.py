@@ -42,6 +42,13 @@ class AidaSettings:
     tool_output_max_age_days: int = 30
     # Жизнь кеша поставщика; 0 — как у хозяина (`prompt_caching.cache_ttl`).
     cache_ttl_seconds: float = 0.0
+    # Сколько последних выводов инструментов не становятся заглушкой, какой бы ни была доля
+    # (0 — граница только по доле). Гарантия, что последний read_file или вывод тестов цел.
+    keep_last_tool_results: int = 0
+    # Выводы этих инструментов не становятся заглушкой никогда (например, todo — план задачи).
+    exclude_tools: tuple = ()
+    # Какие типы записей ядра видит профиль (rule, decision, project, lesson…); пусто — все.
+    core_types: tuple = ()
 
     @property
     def step_keep(self) -> float:
@@ -69,6 +76,20 @@ def _section() -> dict:
     return section if isinstance(section, dict) else {}
 
 
+def _names(raw) -> tuple | None:
+    """Список имён из конфига: YAML-список или строка через запятую. Порядок не важен — сортируем,
+    чтобы одинаковый смысл давал одинаковые настройки."""
+    if isinstance(raw, str):
+        items = raw.split(",")
+    elif isinstance(raw, (list, tuple)):
+        items = raw
+    else:
+        return None
+    if not all(isinstance(item, str) for item in items):
+        return None
+    return tuple(sorted({item.strip() for item in items if item.strip()}))
+
+
 def load_settings() -> AidaSettings:
     """Настройки для текущего хода. Кривое значение — предупреждение и значение по умолчанию."""
     section = _section()
@@ -79,6 +100,13 @@ def load_settings() -> AidaSettings:
         if raw is None and item.name in _LEGACY_ENV:
             raw = os.environ.get(_LEGACY_ENV[item.name]) or None
         if raw is None:
+            continue
+        if isinstance(default, tuple):
+            names = _names(raw)
+            if names is None:
+                logger.warning("Витрина: aida.%s = %r — нужен список имён, беру %s", item.name, raw, default)
+                continue
+            values[item.name] = names
             continue
         try:
             value = type(default)(float(raw)) if isinstance(default, int) else float(raw)

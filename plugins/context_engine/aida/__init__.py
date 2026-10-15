@@ -283,7 +283,7 @@ class AidaContextEngine(ContextEngine):
         budget = self._budget_chars(budget_tokens, settings)
 
         if state.knowledge is None or cold:
-            fresh = self._load_knowledge(int(budget * settings.knowledge_share))
+            fresh = self._load_knowledge(int(budget * settings.knowledge_share), settings.core_types)
             if fresh is not None:
                 state.knowledge = fresh
         knowledge = state.knowledge or ""
@@ -295,7 +295,9 @@ class AidaContextEngine(ContextEngine):
         tail, state.tail, rebased = select_tail(conversation, tail_budget, state.tail, force=cold,
                                                 paths=state.paths, protect=settings.protected_exchanges,
                                                 talk_share=settings.conversation_share,
-                                                keep_share=settings.keep_results_share)
+                                                keep_share=settings.keep_results_share,
+                                                keep_last=settings.keep_last_tool_results,
+                                                exclude=settings.exclude_tools)
         talk, tools, stubs = breakdown(tail)
         self._turn_requests += 1
         self._turn_rebuilds += int(rebased)
@@ -303,7 +305,7 @@ class AidaContextEngine(ContextEngine):
                         "tools": tools, "stubs": stubs, "capped": capped, "sent": len(tail),
                         "total": len(conversation), "tail_budget": tail_budget}
         if rebased:
-            aged = count_aged(conversation, state.tail.aged)
+            aged = count_aged(conversation, state.tail.aged, settings.exclude_tools)
             if aged > state.aged:
                 # Модель, которой понадобился отпущенный результат, перечитает файл. Без
                 # сброса хозяин ответил бы «файл не менялся» — в расчёте на содержимое,
@@ -406,14 +408,20 @@ class AidaContextEngine(ContextEngine):
         except Exception:
             logger.debug("Витрина: сбросить учёт просмотра навыков не удалось", exc_info=True)
 
-    def _load_knowledge(self, budget: int) -> str | None:
-        """Ядро из общей памяти. None — прочитать не удалось, попробуем на следующем запросе."""
+    def _load_knowledge(self, budget: int, types: tuple = ()) -> str | None:
+        """Ядро из общей памяти. None — прочитать не удалось, попробуем на следующем запросе.
+
+        `types` — какие типы записей видит этот профиль (`aida.core_types`); пусто — все. Хранилище
+        общее, фильтр только на чтение: разработчику незачем держать в окне факты о жизни оператора.
+        """
         store = self._get_store()
         if store is None:
             return None
         rows = store.core_rows()
         if rows is None:
             return None
+        if types:
+            rows = [row for row in rows if (row.get("memory_type") or "") in types]
         return build_knowledge_block(rows, budget)
 
     def _get_store(self) -> Any:
