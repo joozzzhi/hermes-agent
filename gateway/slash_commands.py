@@ -537,6 +537,18 @@ class GatewaySlashCommandsMixin(
         if self._restart_requested or self._draining:
             count = self._running_agent_count()
             return t("gateway.draining", count=count) if count else EphemeralReply(t("gateway.restart.in_progress"))
+        # Forensics: name WHO asked (an unattributed "Stopping gateway for restart..." left the
+        # 22.10 outage uninvestigable).
+        try:
+            from hermes_constants import get_hermes_home, get_process_hermes_home
+            src = event.source
+            logger.warning(
+                "/restart requested: platform=%s chat=%s user=%s(%s) update_id=%s profile_home=%s launch_home=%s",
+                src.platform.value if src and src.platform else "?", getattr(src, "chat_id", "?"),
+                getattr(src, "user_name", "?"), getattr(src, "user_id", "?"), event.platform_update_id,
+                get_hermes_home(), get_process_hermes_home())
+        except Exception:
+            logger.warning("/restart requested (source unavailable)")
 
         async def _write_marker(name: str, build, label: str) -> None:
             try:
