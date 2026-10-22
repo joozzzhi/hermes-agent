@@ -1362,10 +1362,18 @@ class GatewayShutdownMixin:
     # Restart orchestration
     @staticmethod
     def _restart_watcher_env() -> dict:
-        """Watcher env minus ``_HERMES_GATEWAY`` (else the CLI's self-restart guard refuses; gateway stays down)."""
+        """Watcher env minus ``_HERMES_GATEWAY`` (else the CLI's self-restart guard refuses; gateway stays down).
+
+        HERMES_HOME is pinned to the PROCESS (launch) home, never the turn's routed profile: under
+        multiplex a ``/restart`` sent to a served profile's bot runs with that profile's home override,
+        and a watcher inheriting it relaunched a standalone gateway for that profile only — the launch
+        gateway (and every other multiplexed bot) stayed down."""
         from gateway.config_loader import drop_bridged_env
+        from hermes_constants import apply_subprocess_home_env, get_process_hermes_home
         from tools.environments.local import build_subprocess_env
-        watcher_env = drop_bridged_env(build_subprocess_env(scrub_secrets=False, inherit_profile_home=True))
+        watcher_env = drop_bridged_env(build_subprocess_env(scrub_secrets=False, inherit_profile_home=False))
+        watcher_env["HERMES_HOME"] = str(get_process_hermes_home())
+        apply_subprocess_home_env(watcher_env)
         watcher_env.pop("_HERMES_GATEWAY", None)
         return watcher_env
 
